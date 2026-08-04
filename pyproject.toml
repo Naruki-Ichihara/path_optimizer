@@ -1,0 +1,117 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "path_optimizer"
+version = "0.1.0"
+description = "GPU-accelerated path optimization built on feax and JAX."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Naruki Ichihara", email = "ichihara.naruki@nihon-u.ac.jp" }]
+keywords = ["optimization", "path-planning", "finite-element", "jax", "gpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+# JAX is intentionally absent from the core dependencies: the NVCR base image
+# ships a CUDA-compiled JAX that must not be clobbered. Install the `jax` extra
+# (or `cuda13`) outside containers.
+dependencies = [
+    "feax>=0.5.2",
+    "numpy",
+    "scipy",
+    "nlopt",
+    "h5py",       # feax.XDMFWriter — the optimisation history time series
+    "meshio",     # feax.utils.save_sol — per-iteration VTU snapshots
+    "matplotlib", # history.png
+    "scikit-image", # paths.extract_paths — marching squares
+    "tsp-solver2", # paths.order_paths — greedy edge matching plus 2-opt
+    # G-code generation. Installed straight from git: the PyPI wheel (0.1.2) lags
+    # master, and upstream's own instructions are `pip install git+...`. Its deps
+    # (numpy / plotly / pydantic) are JAX-free, so it is safe to resolve normally
+    # inside the container.
+    "fullcontrol @ git+https://github.com/FullControlXYZ/fullcontrol",
+]
+
+[project.optional-dependencies]
+jax = ["jax[cuda13]"]
+sksparse = ["scikit-sparse"]
+# Smoothed-aggregation AMG preconditioning on GPU (see Dockerfile).
+amg = ["amjax", "pyamg"]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "mypy",
+]
+docs = [
+    "pydoc-markdown",
+]
+cuda13 = [
+    "jax[cuda13]",
+    "nvidia-cudss-cu13",
+    "nvidia-cublas",
+    "nvidia-cuda-runtime",
+    "nvidia-cudnn-cu13",
+    "nvidia-cuda-nvcc",
+    "nanobind",
+    "scikit-build-core>=0.5",
+    "ninja",
+    "cmake",
+]
+cuda12 = [
+    "jax[cuda12]",
+    "nvidia-cudss-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-nvcc-cu12",
+    "nanobind",
+    "scikit-build-core>=0.5",
+    "ninja",
+    "cmake",
+]
+
+[project.urls]
+Homepage = "https://github.com/Naruki-Ichihara/path_optimizer"
+Repository = "https://github.com/Naruki-Ichihara/path_optimizer"
+
+# Required by hatchling to accept the `fullcontrol @ git+...` direct reference
+# above. Note: PyPI rejects sdists/wheels carrying direct-reference deps, so
+# path_optimizer cannot be published to PyPI while this dependency stays a git URL.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["path_optimizer"]
+
+[tool.hatch.build.targets.sdist]
+include = ["path_optimizer", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

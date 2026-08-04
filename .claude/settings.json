@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill -9 583794)",
+      "Bash(timeout 300 python -c ' *)",
+      "Bash(python -m pytest tests/test_paths.py -q)",
+      "Bash(cd /usr/local/lib/python3.12/dist-packages/fullcontrol && sed -n '1,40p' gcode/printer.py && echo \"=== base_settings ===\" && grep -n \"relative_e\\\\|e_units\\\\|dia_feed\" devices/community/singletool/base_settings.py && echo \"=== MultitoolPrinter refs ===\" && grep -rn \"Multitool\\\\|multitool\" --include=*.py . )",
+      "Read(//usr/local/lib/python3.12/dist-packages/fullcontrol/**)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
