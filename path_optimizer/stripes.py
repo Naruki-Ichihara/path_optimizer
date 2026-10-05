@@ -80,6 +80,8 @@ import numpy as onp
 from feax.assembler import create_J_bc_csr_function, create_res_bc_function
 from feax.mechanics.orientation import orientation_tensor_2d
 
+from path_optimizer.materials import DEFAULT_SGN_BETA
+
 __all__ = [
     "AlignedSHStep",
     "SHSolver",
@@ -1055,7 +1057,8 @@ def relax_hybrid(sh: SHSolver, director, mask, *, gate_lo: float = 5.0,
 
 # ── Director extraction ──────────────────────────────────────────────────────
 
-def director_from_orientation(x1, x2, x3, *, sgn_beta: float = 10.0):
+def director_from_orientation(x1, x2, x3, *,
+                              sgn_beta: float = DEFAULT_SGN_BETA):
     """Unit director ``(n_nodes, 2)`` from the libertas orientation triple.
 
     Maps ``(x1, x2, x3)`` to the second-order orientation tensor ``a₂`` and
@@ -1126,7 +1129,8 @@ def resample(values, src_mesh, dst_points):
 # ── OptimizeResult adapter ───────────────────────────────────────────────────
 
 def stripes_from_result(result, layers, stripe_period: float, *, mesh=None,
-                        rho_cutoff: float = 0.5, sgn_beta: float = 10.0,
+                        rho_cutoff: float = 0.5,
+                        sgn_beta: float = DEFAULT_SGN_BETA,
                         epsilon: float = 1.0, gamma: float = DEFAULT_GAMMA,
                         dt: float = 0.5, seed_from: str = "hybrid",
                         phase_steps: int = 10, free_steps: int = 250,
@@ -1244,6 +1248,25 @@ def stripes_from_result(result, layers, stripe_period: float, *, mesh=None,
             raise ValueError(
                 f"layer {k}: no node has rho > {rho_cutoff}; the mask is empty "
                 "so there is nothing to grow stripes in")
+
+        if k == 0 and seed_from != "noise":
+            # tol/patience/max_steps/min_steps are relax()'s convergence budget
+            # and only the noise path runs relax() to convergence.  The phase
+            # and hybrid paths run a fixed number of steps instead, so a caller
+            # who sets a budget here gets neither the steps they asked for nor
+            # any complaint.
+            ignored = [n for n, v, d in (("tol", tol, DEFAULT_TOL),
+                                         ("patience", patience, 5),
+                                         ("max_steps", max_steps, 1000),
+                                         ("min_steps", min_steps, 20))
+                       if v != d]
+            if ignored:
+                warnings.warn(
+                    f"{', '.join(ignored)} {'are' if len(ignored) > 1 else 'is'} "
+                    f"ignored by seed_from={seed_from!r}, which runs a fixed "
+                    f"{'phase_steps + free_steps' if seed_from == 'hybrid' else 'phase_steps'}"
+                    " budget; pass seed_from='noise' to relax to a tolerance",
+                    stacklevel=2)
 
         if seed_from == "hybrid":
             rel, _, _ = relax_hybrid(

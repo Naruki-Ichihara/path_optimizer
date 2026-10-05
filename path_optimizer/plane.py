@@ -214,9 +214,37 @@ def design_space(
     ``(rho, x1, x2, x3)`` in the order
     :func:`path_optimizer.materials.orientation_blend` expects.
 
-    The orientation fields start at ``-1 + ori_tol`` rather than exactly ``-1``:
-    the corner of the libertas box maps to a degenerate ``a₂`` whose gradient
-    vanishes, so an exact-corner start never leaves it.
+    The orientation fields start at ``+1 - ori_tol``, which ``box_to_triangle``
+    maps to ``a11 = a22 = 0.5``: a full fibre population with **no preferred
+    direction**.  That is what a neutral default should be — it chooses no
+    direction, it just starts with fibre to point.
+
+    Not ``-1 + ori_tol``, the other corner, which maps to ``a11 = a22 = 0.005``
+    — an orientation tensor that is essentially empty.  ``a12`` is built as
+    ``sqrt(a11 a22) · smooth_sgn(x3)``, so that corner scales everything ``x3``
+    can do by 0.005, and ``x3`` is the *only* variable that can turn an
+    isotropic ``a11 = a22`` into a direction.  Measured on the MBB example
+    there, ``|d obj/dx3|`` is 69x smaller than ``|d obj/dx1|``; from
+    ``+1 - ori_tol`` it is 2.5x larger.  The optimiser pushes ``x1`` and ``x2``
+    together instead, which only grows the trace, and the tensor stays
+    isotropic: ``ud_penalty`` sat at exactly 1.0 for every iteration of a
+    200-iteration run, and the x-tolerance read the stalled design as converged
+    after 4.
+
+    Starting points measured on that example, every one judged by the
+    compliance it reached (lower is better):
+
+    ===================================  ==========  =====================
+    start                                compliance  vs the best *uniform*
+    ===================================  ==========  =====================
+    ``+1 - ori_tol``  (a2 = I/2)         0.523       1.25x better
+    uniform 0 / 45 / 135 degrees         0.516-0.534 better
+    uniform 90 degrees                   0.684       about equal
+    ``-1 + ori_tol``  (a2 ~ 0)           0.729       1.12x **worse**
+    ===================================  ==========  =====================
+
+    The three direction-neutral starts land within 1.04x of each other, so the
+    answer does not hinge on which one; the old default was the outlier.
     """
     # An explicit radius wins over the fractional default, rather than tripping
     # DesignField's "give one or the other" guard.
@@ -229,7 +257,7 @@ def design_space(
                           init=rho_init, filter_frac=rho_filter_frac,
                           filter_radius=rho_filter_radius)]
     if oriented:
-        start = -1.0 + ori_tol
+        start = 1.0 - ori_tol
         for name, init, (lo, hi) in (("x1", start, (-1.0, 1.0)),
                                      ("x2", start, (-1.0, 1.0)),
                                      ("x3", 0.0, x3_bounds)):

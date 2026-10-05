@@ -129,8 +129,11 @@ def test_explicit_filter_radius_overrides_the_fraction():
 
 # ── laminated shell ──────────────────────────────────────────────────────────
 
-LAMINA = materials.Lamina()
-POLYMER = materials.Polymer()
+# Spelled out, not a preset: these numbers decide what the tests assert.
+LAMINA = materials.Lamina(E1=140.0e9, E2=10.0e9, G12=5.0e9, nu12=0.30,
+                          G13=5.0e9, G23=3.0e9,
+                          alpha_1=-0.5e-6, alpha_2=30.0e-6, thickness=0.5e-3)
+POLYMER = materials.Polymer(E=2.0e9, nu=0.40, alpha=70.0e-6)
 SLX, SLY = 0.2, 0.1
 
 # libertas orientation triples: fully aligned with x, and with y.
@@ -245,3 +248,99 @@ def test_shell_optimisation_stiffens_the_plate(tmp_path):
                     max_iter=5, output_dir=tmp_path, verbose=False)
     assert result.history["obj"][-1] < result.history["obj"][0]
     assert result.history["w_max_mm"][-1] < result.history["w_max_mm"][0]
+
+
+# ── Void vs matrix as the low-density phase ──────────────────────────────────
+
+ALIGNED = (1.0 - 1e-2, -1.0 + 1e-2, 1.0)        # unidirectional along x
+
+
+def test_a_matrix_leaves_the_void_load_bearing():
+    """The two-phase reading: rho = 0 is polymer, not nothing."""
+    layer = materials.orientation_blend(LAMINA, POLYMER)
+    solid = float(layer(1.0, *ALIGNED)[0][0, 0, 0, 0])
+    empty = float(layer(0.0, *ALIGNED)[0][0, 0, 0, 0])
+    assert empty > 0.01 * solid                 # ~1/59 here, nowhere near zero
+
+
+def test_no_matrix_means_no_stiffness_at_zero_density():
+    layer = materials.orientation_blend(LAMINA)  # polymer=None
+    solid = float(layer(1.0, *ALIGNED)[0][0, 0, 0, 0])
+    empty = float(layer(0.0, *ALIGNED)[0][0, 0, 0, 0])
+    assert empty == pytest.approx(1e-9 * solid, rel=1e-6)
+
+
+def test_void_is_the_same_mixture_with_c_poly_set_to_e_min_c_fibre():
+    """Documented equivalence -- one rule of mixtures, not two code paths."""
+    e_min = 1e-4
+    layer = materials.orientation_blend(LAMINA, e_min=e_min)
+    C_fibre = onp.asarray(layer(1.0, *ALIGNED)[0])
+    for rho in (0.0, 0.3, 0.7, 1.0):
+        C = onp.asarray(layer(rho, *ALIGNED)[0])
+        assert C == pytest.approx((e_min + rho * (1.0 - e_min)) * C_fibre,
+                                  rel=1e-10)
+
+
+def test_void_keeps_its_orientation():
+    """e_min scales the oriented tensor, so direction survives into the void."""
+    layer = materials.orientation_blend(LAMINA)
+    C = onp.asarray(layer(0.0, *ALIGNED)[0])
+    assert C[0, 0, 0, 0] > 10.0 * C[1, 1, 1, 1]
+
+
+def test_e_min_is_checked_only_where_it_is_used():
+    with pytest.raises(ValueError, match="e_min"):
+        materials.orientation_blend(LAMINA, e_min=1.0)
+    # Irrelevant with a matrix phase, so not validated there.
+    materials.orientation_blend(LAMINA, POLYMER, e_min=1.0)
+
+
+# ── Transverse knock-down ────────────────────────────────────────────────────
+
+def test_knockdown_is_off_unless_asked_for():
+    """The four-argument contract is what plane and shell call."""
+    assert materials.orientation_blend(LAMINA).__code__.co_argcount == 4
+    assert materials.orientation_blend(
+        LAMINA, transverse_knockdown=True).__code__.co_argcount == 5
+
+
+def test_knockdown_of_one_is_the_untouched_material():
+    plain = materials.orientation_blend(LAMINA)
+    kd = materials.orientation_blend(LAMINA, transverse_knockdown=True)
+    assert onp.asarray(kd(1.0, *ALIGNED, 1.0)[0]) == pytest.approx(
+        onp.asarray(plain(1.0, *ALIGNED)[0]), rel=1e-12)
+
+
+def test_knockdown_raises_the_stiffness_contrast():
+    """The whole point: it makes one fibre direction unmistakably better."""
+    kd = materials.orientation_blend(LAMINA, transverse_knockdown=True)
+
+    def contrast(k):
+        C = onp.asarray(kd(1.0, *ALIGNED, k)[0])
+        return C[0, 0, 0, 0] / C[1, 1, 1, 1]
+
+    ratios = [contrast(k) for k in (1.0, 0.3, 0.1, 0.02)]
+    assert ratios == sorted(ratios)                 # monotone in 1/k
+    assert ratios[-1] > 5.0 * ratios[0]
+
+
+def test_knockdown_leaves_the_fibre_direction_alone():
+    """It scales E2, so the stiff direction must not move."""
+    kd = materials.orientation_blend(LAMINA, transverse_knockdown=True)
+    along = [float(onp.asarray(kd(1.0, *ALIGNED, k)[0])[0, 0, 0, 0])
+             for k in (1.0, 0.02)]
+    assert along[1] == pytest.approx(along[0], rel=0.05)
+
+
+def test_knockdown_reaches_the_constitutive_through_the_problem():
+    """A uniform fifth volume var, not a design variable -- that is how it is
+    scheduled, so it has to survive the trip into get_tensor_map."""
+    import jax.numpy as jnp
+    layer = materials.orientation_blend(LAMINA, transverse_knockdown=True)
+    mesh = fe.mesh.rectangle_mesh(Nx=4, Ny=2, domain_x=LX, domain_y=LY,
+                                  ele_type="QUAD4")
+    stress = plane.make_plane_stress(mesh, layer, thickness=1.0).get_tensor_map()
+    pull_across = jnp.array([[0.0, 0.0], [0.0, 1.0e-3]])   # transverse stretch
+    full = float(stress(pull_across, 1.0, *ALIGNED, 1.0)[1, 1])
+    knocked = float(stress(pull_across, 1.0, *ALIGNED, 0.02)[1, 1])
+    assert knocked < 0.1 * full

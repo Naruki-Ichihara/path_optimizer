@@ -198,13 +198,38 @@ def test_patience_requires_consecutive_quiet_steps(sh):
 
 def test_not_converging_warns_but_still_returns(two_layer_result):
     """Hitting the cap is reported, not raised: an under-annealed pattern is
-    usually still usable, but the caller must be told."""
+    usually still usable, but the caller must be told.
+
+    Only the noise path relaxes to a tolerance, so that is what this pins; the
+    fixed-budget paths are covered by
+    :func:`test_a_convergence_budget_the_seed_path_ignores_warns`.
+    """
     with pytest.warns(UserWarning, match="max_steps"):
         out = stripes.stripes_from_result(two_layer_result, LAYERS[:1], PERIOD,
-                                          tol=1e-12, max_steps=6)
+                                          seed_from="noise", tol=1e-12,
+                                          max_steps=6)
     assert out[0].steps == 6
     assert not out[0].converged
     assert out[0].u.shape == (two_layer_result.mesh.points.shape[0],)
+
+
+def test_a_convergence_budget_the_seed_path_ignores_warns(two_layer_result):
+    """hybrid and phase run a fixed step count; a tolerance means nothing there.
+
+    Passing one used to be accepted in silence, so the caller got 260 steps
+    after asking for 6.
+    """
+    with pytest.warns(UserWarning, match="ignored by seed_from='hybrid'"):
+        out = stripes.stripes_from_result(two_layer_result, LAYERS[:1], PERIOD,
+                                          max_steps=6, phase_steps=2,
+                                          free_steps=3)
+    assert out[0].steps != 6                         # it ran its own budget
+
+
+def test_no_warning_when_the_budget_is_left_alone(two_layer_result, recwarn):
+    stripes.stripes_from_result(two_layer_result, LAYERS[:1], PERIOD,
+                                phase_steps=2, free_steps=3)
+    assert not [w for w in recwarn if "ignored by seed_from" in str(w.message)]
 
 
 # ── Physics ──────────────────────────────────────────────────────────────────

@@ -37,7 +37,9 @@ Example
 
     from path_optimizer import materials, shell
 
-    lamina, polymer = materials.Lamina(), materials.Polymer()
+    lamina = materials.Lamina(E1=140e9, E2=10e9, G12=5e9, nu12=0.30,
+                              G13=5e9, G23=3e9, thickness=0.5e-3)
+    polymer = materials.Polymer(E=2.0e9, nu=0.40)
     layer = materials.orientation_blend(lamina, polymer)
 
     problem = shell.make_laminated_shell(

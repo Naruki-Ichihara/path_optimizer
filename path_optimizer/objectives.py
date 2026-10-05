@@ -62,6 +62,8 @@ import numpy as onp
 from feax.gene import create_compliance_fn, create_volume_fn
 from feax.mechanics.orientation import orientation_tensor_2d
 
+from path_optimizer.materials import DEFAULT_SGN_BETA
+
 __all__ = [
     # displacement matching
     "displacement_error",
@@ -212,7 +214,8 @@ def _mag_one(x1, x2, x3, rho, sgn_beta):
     return (t_mag - rho) ** 2
 
 
-def ud_penalty(design, layers: Sequence[Sequence[str]], *, sgn_beta: float = 10.0):
+def ud_penalty(design, layers: Sequence[Sequence[str]], *,
+               sgn_beta: float = DEFAULT_SGN_BETA):
     """Density-weighted unidirectionality penalty, averaged over layers.
 
     Per node, ``4·det(a₂)/tr(a₂)²`` is 0 when the orientation tensor is rank-1
@@ -233,7 +236,7 @@ def ud_penalty(design, layers: Sequence[Sequence[str]], *, sgn_beta: float = 10.
 
 
 def magnitude_consistency(design, layers: Sequence[Sequence[str]], *,
-                          sgn_beta: float = 10.0):
+                          sgn_beta: float = DEFAULT_SGN_BETA):
     """Mean ``(|T| − ρ)²`` over layers — ties alignment strength to density.
 
     ``|T|`` is the orientation tensor's anisotropy magnitude: 0 when isotropic,
@@ -248,7 +251,7 @@ def magnitude_consistency(design, layers: Sequence[Sequence[str]], *,
 
 
 def create_orientation_smoothness_fn(problem, *, length_scale: float,
-                                     sgn_beta: float = 10.0,
+                                     sgn_beta: float = DEFAULT_SGN_BETA,
                                      var_index: int = 0):
     """Penalise how fast the fibre direction turns — ``fn(design, layers)``.
 
