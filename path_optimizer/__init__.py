@@ -8,6 +8,7 @@ from path_optimizer import (
     paths,
     plane,
     shell,
+    solids,
     stripes,
 )
 from path_optimizer.geometry import cantilever_edges, edge_predicate
@@ -37,6 +38,7 @@ __all__ = [
     "paths",
     "plane",
     "shell",
+    "solids",
     "stripes",
     # design space
     "DesignField",

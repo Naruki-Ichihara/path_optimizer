@@ -5,8 +5,16 @@ can follow, and hand them to FullControl as a design.
 
 .. code-block:: text
 
-    StripeField  --extract_paths-->  polylines  --to_fullcontrol-->  fc steps
-                                          \\--write_svg-->  .svg
+    StripeField --extract_paths--> polylines --to_fullcontrol--> fc steps
+                                       |
+                                       +--write_svg--> .svg    (edit, inspect)
+                                       +--write_dxf--> .dxf    (CAD, CAM)
+                                       +--write_step-> .step   (CAD)
+
+:func:`simplify` goes before any of the three file writers.  Contours come off
+the stripe mesh at about one vertex per element, which is ~20x more than the
+geometry needs; on a real part 0.05 mm of tolerance removes 95% of them and
+moves nothing measurably.
 
 The path skeleton is the **zero level set** of ``u``.  Crests and troughs are
 where material would go if you were printing the stripe pattern itself, but a
@@ -47,6 +55,7 @@ code.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import warnings
 from dataclasses import dataclass
 from xml.etree import ElementTree
@@ -59,12 +68,21 @@ __all__ = [
     "Path",
     "extract_paths",
     "extract_region_contours",
+    "clip_to_region",
     "KIND_COLOURS",
     "write_svg",
     "read_svg",
+    "write_dxf",
+    "write_step",
+    "KIND_ACI",
     "by_kind",
     "tag",
     "connect",
+    "smooth",
+    "simplify",
+    "trim_hairpins",
+    "spread_ends",
+    "turn_radius",
     "order_paths",
     "travel_distance",
     "tool_change",
@@ -186,8 +204,40 @@ def tag(paths, kind: str) -> list[Path]:
 
 # ── Connecting ───────────────────────────────────────────────────────────────
 
+def _crosses(bridge, segments) -> bool:
+    """Does the straight bridge cut across any of these segments?
+
+    Proper crossings only: two segments that merely share an endpoint, which
+    every weld does with the paths it joins, are not a crossing.
+    """
+    if not len(segments):
+        return False
+    p, r = bridge[0], bridge[1] - bridge[0]
+    q, s_ = segments[:, 0], segments[:, 1] - segments[:, 0]
+    denom = r[0] * s_[:, 1] - r[1] * s_[:, 0]
+    qp = q - p
+    with onp.errstate(divide="ignore", invalid="ignore"):
+        t = (qp[:, 0] * s_[:, 1] - qp[:, 1] * s_[:, 0]) / denom
+        u = (qp[:, 0] * r[1] - qp[:, 1] * r[0]) / denom
+    eps = 1e-9
+    hit = (onp.abs(denom) > 1e-30) & (t > eps) & (t < 1 - eps) & (u > eps) & (u < 1 - eps)
+    return bool(hit.any())
+
+
+def _segments_of(paths, skip_ids):
+    """Every segment of every path except the two ends of the weld."""
+    out = []
+    for k, path in enumerate(paths):
+        if k in skip_ids:
+            continue
+        q = onp.asarray(path.nodes)
+        if len(q) >= 2:
+            out.append(onp.stack([q[:-1], q[1:]], axis=1))
+    return onp.concatenate(out) if out else onp.zeros((0, 2, 2))
+
+
 def connect(paths, *, tolerance: float, group_by_kind: bool = True,
-            close_loops: bool = False) -> list[Path]:
+            close_loops: bool = False, no_cross: bool = False) -> list[Path]:
     """Weld consecutive paths whose ends nearly meet, **in the order given**.
 
     Contouring cuts a field wherever the level set happens to break, so what the
@@ -231,7 +281,11 @@ def connect(paths, *, tolerance: float, group_by_kind: bool = True,
         Also close a finished chain whose two ends are within ``tolerance``,
         making it a closed path.  Off by default — a loop is a different thing
         to sequence and to print, so becoming one is worth asking for.
-
+    no_cross : bool
+        Refuse a weld whose bridge would cut across another path.  A bridge is
+        a straight line drawn through whatever lies between the two ends, and
+        at a few path pitches it starts running over the part instead of along
+        it.  Costs one segment-intersection pass per candidate weld.
     Returns
     -------
     list of Path
@@ -248,7 +302,8 @@ def connect(paths, *, tolerance: float, group_by_kind: bool = True,
         return []
 
     runs: list[list[Path]] = []
-    for path in paths:
+    last_index: list[int] = []          # which input path each run ends on
+    for index, path in enumerate(paths):
         weldable = (
             runs
             and tolerance > 0
@@ -257,10 +312,17 @@ def connect(paths, *, tolerance: float, group_by_kind: bool = True,
             and (not group_by_kind or path.kind == runs[-1][-1].kind)
             and onp.linalg.norm(path.start - runs[-1][-1].end) <= tolerance
         )
+        if weldable and no_cross:
+            prev = runs[-1][-1]
+            bridge = onp.vstack([prev.end, path.start])
+            others = _segments_of(paths, {index, last_index[-1]})
+            weldable = not _crosses(bridge, others)
         if weldable:
             runs[-1].append(path)
+            last_index[-1] = index
         else:
             runs.append([path])
+            last_index.append(index)
     return [_join(r, tolerance, close_loops) for r in runs]
 
 
@@ -532,6 +594,12 @@ def extract_paths(field: StripeField, *, level: float = 0.0,
     level : float
         Contour level.  ``0.0`` gives paths at the requested pitch; a non-zero
         level shifts them off centre and makes alternate gaps uneven.
+    extra : int
+        Drop this many further vertices from each side once ``clearance`` is
+        met.  The clearance test is satisfied the moment the two ends are far
+        enough apart, which on a gentle turn is barely past the apex and leaves
+        the two beads still running alongside each other.  Two or three extra
+        vertices open it properly.  ``max_trim`` still bounds the total.
     min_length : float, optional
         Drop polylines shorter than this.  Defaults to two stripe periods —
         anything shorter is a fragment at a defect or a mask corner, and costs
@@ -602,7 +670,7 @@ def extract_paths(field: StripeField, *, level: float = 0.0,
 
 
 def extract_region_contours(field: StripeField, *, invert: bool = False,
-                            min_points: int = 4,
+                            offset: float = 0.0, min_points: int = 4,
                             samples_per_period: int = 8) -> list[onp.ndarray]:
     """Closed boundary polygons of the solid region (or its complement).
 
@@ -610,6 +678,25 @@ def extract_region_contours(field: StripeField, *, invert: bool = False,
     cover, which is what a filling process needs bounded.  The grid is
     zero-padded first so a region touching the domain edge still closes, and
     interior holes come back as their own loops.
+
+    Parameters
+    ----------
+    offset : float
+        Move the loops this far **into** the region, in the mesh's units.  A
+        bead printed on the boundary itself hangs half its width over the edge
+        and lands on whatever the fill put there; half a bead width in, it sits
+        inside the part and beside the fill rather than on it.
+
+        The offset is a level set of the distance to the boundary, not a
+        displaced polygon, so it cannot self-intersect: where the part is
+        narrower than twice ``offset`` the loop closes up and disappears, which
+        is the correct answer — there is no room for a perimeter there.
+
+    Returns
+    -------
+    list of ``(n, 2)`` arrays
+        Closed loops.  Fewer than at ``offset = 0`` when thin features drop
+        out, and a loop may split in two where a waist pinches off.
     """
     from skimage import measure
 
@@ -618,8 +705,23 @@ def extract_region_contours(field: StripeField, *, invert: bool = False,
     region = (mask_grid <= 0.5) if invert else (mask_grid > 0.5)
     padded = onp.pad(region.astype(float), 1, constant_values=0.0)
 
+    level = 0.5
+    if offset:
+        from scipy.ndimage import distance_transform_edt
+
+        if offset < 0:
+            raise ValueError(f"offset moves into the region, so it must not be "
+                             f"negative; got {offset}")
+        # `sampling` makes the transform physical, so the level is the offset
+        # itself.  The half cell is where the binary boundary actually lies:
+        # the first foreground cell centre is half a cell inside it.
+        dy = float(ys[1] - ys[0]) if ys.size > 1 else step
+        dx = float(xs[1] - xs[0]) if xs.size > 1 else step
+        padded = distance_transform_edt(padded > 0.5, sampling=(dy, dx))
+        level = offset + 0.5 * min(dx, dy)
+
     polys = []
-    for c in measure.find_contours(padded, level=0.5):
+    for c in measure.find_contours(padded, level=level):
         if c.shape[0] < min_points:
             continue
         rows = onp.clip(c[:, 0] - 1.0, 0.0, ys.size - 1)
@@ -631,10 +733,102 @@ def extract_region_contours(field: StripeField, *, invert: bool = False,
     return polys
 
 
+def _inset_field(field, samples_per_period: int):
+    """Distance from the region's boundary, as a grid plus its axes."""
+    from scipy.ndimage import distance_transform_edt
+
+    step = field.stripe_period / max(1, samples_per_period)
+    (mask_grid,), xs, ys = _rasterise(field.mesh, (field.mask,), step)
+    dy = float(ys[1] - ys[0]) if ys.size > 1 else step
+    dx = float(xs[1] - xs[0]) if xs.size > 1 else step
+    inside = onp.pad(mask_grid, 1, constant_values=0.0) > 0.5
+    depth = distance_transform_edt(inside, sampling=(dy, dx))[1:-1, 1:-1]
+    return depth - 0.5 * min(dx, dy), xs, ys
+
+
+def clip_to_region(paths, field: StripeField, *, inset: float,
+                   samples_per_period: int = 8, min_length: float | None = None):
+    """Keep only the parts of each path that lie ``inset`` inside the boundary.
+
+    The companion to :func:`extract_region_contours`'s ``offset``, and the half
+    that actually stops the two fouling each other.  Moving a perimeter inwards
+    does not get it clear of the fill — the fill is everywhere, so the
+    perimeter just lands further onto it.  What a slicer does, and what this
+    does, is cut the fill back and leave the perimeter the room.
+
+    For a perimeter whose centre line sits ``w/2`` in, its bead reaches ``w``
+    from the edge, so the fill's centre line has to start at ``1.5 * w``: that
+    is the ``inset`` to ask for.
+
+    Where a path leaves the region it is cut, and the crossing point is
+    interpolated rather than snapped to the last vertex inside, so the end
+    lands on the inset line and not up to one sample short of it.
+
+    Parameters
+    ----------
+    paths : sequence of :class:`Path` or of ``(n, 2)`` arrays
+    field : StripeField
+        Supplies the mask the distance is measured from.
+    inset : float
+        How far inside the boundary a point must be to survive, in the mesh's
+        units.
+    min_length : float, optional
+        Drop surviving pieces shorter than this.  Defaults to ``2 * inset``.
+
+    Returns
+    -------
+    list of :class:`Path`
+        More paths than went in, each keeping its parent's kind.  Re-run
+        :func:`order_paths`: the sequence has changed.
+    """
+    if inset < 0:
+        raise ValueError(f"inset must not be negative, got {inset}")
+    depth, xs, ys = _inset_field(field, samples_per_period)
+    min_length = 2.0 * inset if min_length is None else min_length
+
+    def depth_at(q):
+        """Bilinear sample of the distance field at arbitrary points."""
+        fx = onp.clip((q[:, 0] - xs[0]) / (xs[1] - xs[0]), 0, xs.size - 1.000001)
+        fy = onp.clip((q[:, 1] - ys[0]) / (ys[1] - ys[0]), 0, ys.size - 1.000001)
+        i0, j0 = fy.astype(int), fx.astype(int)
+        ty, tx = fy - i0, fx - j0
+        d00, d01 = depth[i0, j0], depth[i0, j0 + 1]
+        d10, d11 = depth[i0 + 1, j0], depth[i0 + 1, j0 + 1]
+        return ((1 - ty) * ((1 - tx) * d00 + tx * d01)
+                + ty * ((1 - tx) * d10 + tx * d11))
+
+    out: list[Path] = []
+    for path in _as_paths(paths):
+        q = onp.asarray(path.nodes, dtype=float)
+        d = depth_at(q) - inset
+        keep = d >= 0.0
+        if keep.all():
+            out.append(path)
+            continue
+        for lo, hi in _runs(keep):
+            piece = [q[lo:hi]]
+            # Walk out to the crossing on each side, where there is one.
+            if lo > 0:
+                t = d[lo - 1] / (d[lo - 1] - d[lo])
+                piece.insert(0, (q[lo - 1] + t * (q[lo] - q[lo - 1]))[None])
+            if hi < len(q):
+                t = d[hi - 1] / (d[hi - 1] - d[hi])
+                piece.append((q[hi - 1] + t * (q[hi] - q[hi - 1]))[None])
+            nodes = onp.vstack(piece)
+            candidate = Path(nodes, path.kind, path.path_id)
+            if len(nodes) >= 2 and candidate.length >= min_length:
+                out.append(candidate)
+    return out
+
+
 def path_lengths(paths) -> onp.ndarray:
-    """Arc length of each polyline."""
-    return onp.array([
-        float(onp.linalg.norm(onp.diff(p, axis=0), axis=1).sum()) for p in paths])
+    """Arc length of each polyline.
+
+    Takes :class:`Path` objects or bare ``(n, 2)`` arrays, like everything else
+    here -- after :func:`order_paths` the usual thing to have in hand is the
+    former.
+    """
+    return onp.array([p.length for p in _as_paths(paths)])
 
 
 # ── SVG ──────────────────────────────────────────────────────────────────────
@@ -792,6 +986,716 @@ def read_svg(filename) -> list[Path]:
             f"skipped {skipped} <path> element(s): only <polyline> is read",
             stacklevel=2)
     return out
+
+
+#: AutoCAD colour indices standing in for :data:`KIND_COLOURS`, in the same
+#: order.  R12 has no true colour -- a layer carries one integer out of a fixed
+#: 255-entry palette -- so these are the nearest hue, not the same colour.
+KIND_ACI = (5, 30, 3, 2, 6, 94, 170, 1)
+
+#: Characters AutoCAD rejects in a layer name, plus whitespace.  Layer names are
+#: also capped at 31 characters in R12.
+_DXF_BAD = set('<>/\\":;?*|=\'' + " \t\n")
+
+
+def _dxf_layer(kind: str) -> str:
+    """A kind as a DXF layer name, or an error saying why it is not one."""
+    if not kind or _DXF_BAD & set(kind) or len(kind) > 31:
+        raise ValueError(
+            f"kind {kind!r} cannot be a DXF layer name: it must be non-empty, "
+            f"at most 31 characters, and free of whitespace and <>/\\\":;?*|='"
+        )
+    return kind
+
+
+def _dxf_pairs(*pairs):
+    """DXF is a flat stream of (group code, value) lines, two lines each."""
+    return "".join(f"{code}\n{value}\n" for code, value in pairs)
+
+
+def write_dxf(paths, filename, *, scale: float = 1000.0,
+              layer_colours=None) -> None:
+    """Write paths to DXF R12, for CAD or for a CAM package that wants one.
+
+    Each path becomes one ``POLYLINE``, so a run that has been through
+    :func:`connect` exports as it prints: the bridges that welded two contours
+    together are interior vertices of the polyline, indistinguishable from the
+    contour they joined.  Travel moves are not geometry and are not written --
+    what is in the file is what gets deposited.
+
+    **Each ``kind`` becomes its own layer**, in first-seen order, which is the
+    DXF counterpart of :func:`write_svg`'s ``<g id>``.  Freezing a layer in CAD
+    then isolates one material or one process.
+
+    ``scale`` converts the mesh's units to the file's, default metres to
+    millimetres.  Unlike SVG there is **no y flip**: DXF counts y upward, the
+    same way the mesh does, so the coordinates go out unchanged apart from the
+    scale factor.  R12 stores no unit, so a reader will assume whatever its
+    own drawing is set to -- millimetres, by the default above.
+
+    Closed paths are written with the polyline's closed flag set rather than by
+    repeating the first vertex, so CAM sees a loop and not a gap of zero length.
+
+    Parameters
+    ----------
+    paths : sequence of :class:`Path` or of ``(n, 2)`` arrays
+        Bare arrays are taken as the default kind; use :func:`tag` to name them.
+    layer_colours : int or dict, optional
+        One AutoCAD colour index for every layer, or ``{kind: index}``.  By
+        default each kind takes the next entry of :data:`KIND_ACI`.
+
+    See Also
+    --------
+    write_svg : the same drawing with colour, for a browser or a slicer.
+    """
+    items = _as_paths(paths)
+    if not items:
+        warnings.warn("writing a DXF with no paths", stacklevel=2)
+
+    groups = by_kind(items)
+    layers = [_dxf_layer(k) for k in groups]
+    if isinstance(layer_colours, dict):
+        missing = set(groups) - set(layer_colours)
+        if missing:
+            raise ValueError(f"layer_colours has no entry for {sorted(missing)}")
+        aci = {k: int(layer_colours[k]) for k in groups}
+    elif layer_colours is None:
+        aci = {k: KIND_ACI[i % len(KIND_ACI)] for i, k in enumerate(groups)}
+    else:
+        aci = dict.fromkeys(groups, int(layer_colours))
+
+    allpts = (onp.vstack([p.nodes for p in items]) * scale if items
+              else onp.zeros((1, 2)))
+    lo, hi = allpts.min(axis=0), allpts.max(axis=0)
+
+    out = [_dxf_pairs(
+        (0, "SECTION"), (2, "HEADER"),
+        (9, "$ACADVER"), (1, "AC1009"),
+        (9, "$EXTMIN"), (10, f"{lo[0]:.10g}"), (20, f"{lo[1]:.10g}"), (30, "0.0"),
+        (9, "$EXTMAX"), (10, f"{hi[0]:.10g}"), (20, f"{hi[1]:.10g}"), (30, "0.0"),
+        (0, "ENDSEC"),
+        (0, "SECTION"), (2, "TABLES"),
+        (0, "TABLE"), (2, "LAYER"), (70, len(layers)))]
+    for kind, name in zip(groups, layers, strict=True):
+        out.append(_dxf_pairs((0, "LAYER"), (2, name), (70, 0),
+                              (62, aci[kind]), (6, "CONTINUOUS")))
+    out.append(_dxf_pairs((0, "ENDTAB"), (0, "ENDSEC"),
+                          (0, "SECTION"), (2, "ENTITIES")))
+
+    for kind, name in zip(groups, layers, strict=True):
+        for path in groups[kind]:
+            nodes = onp.asarray(path.nodes, dtype=float) * scale
+            closed = path.is_closed
+            if closed:
+                # The closed flag already draws the last segment; keeping the
+                # repeated vertex as well would leave a zero-length one.
+                nodes = nodes[:-1]
+            # 66 = "vertices follow", which R12 requires on every POLYLINE.
+            out.append(_dxf_pairs((0, "POLYLINE"), (8, name), (66, 1),
+                                  (70, 1 if closed else 0)))
+            for x, y in nodes:
+                out.append(_dxf_pairs((0, "VERTEX"), (8, name),
+                                      (10, f"{x:.10g}"), (20, f"{y:.10g}"),
+                                      (30, "0.0")))
+            out.append(_dxf_pairs((0, "SEQEND"), (8, name)))
+
+    out.append(_dxf_pairs((0, "ENDSEC"), (0, "EOF")))
+    with open(filename, "w") as f:
+        f.write("".join(out))
+
+
+def turn_radius(nodes) -> onp.ndarray:
+    """Radius of the circle through each consecutive triple of vertices.
+
+    One value per interior vertex, so ``len(nodes) - 2`` of them.  Collinear
+    triples give ``inf``.  This is the measure of whether a bead of a given
+    width can follow the path: below ``width / 2`` it cannot, and lays material
+    over material instead.
+    """
+    q = onp.asarray(nodes, dtype=float)
+    if len(q) < 3:
+        return onp.full(max(len(q) - 2, 0), onp.inf)
+    a, b, c = q[:-2], q[1:-1], q[2:]
+    ab, bc, ac = b - a, c - b, c - a
+    twice_area = onp.abs(ab[:, 0] * bc[:, 1] - ab[:, 1] * bc[:, 0])
+    sides = (onp.linalg.norm(ab, axis=1) * onp.linalg.norm(bc, axis=1)
+             * onp.linalg.norm(ac, axis=1))
+    return onp.where(twice_area > 1e-12,
+                     sides / (2.0 * onp.maximum(twice_area, 1e-12)), onp.inf)
+
+
+def _runs(flags) -> list[tuple[int, int]]:
+    """Contiguous ``True`` spans of a boolean array as half-open ranges."""
+    idx = onp.flatnonzero(flags)
+    if not len(idx):
+        return []
+    breaks = onp.flatnonzero(onp.diff(idx) > 1)
+    starts = onp.concatenate([[0], breaks + 1])
+    ends = onp.concatenate([breaks + 1, [len(idx)]])
+    return [(int(idx[a]), int(idx[b - 1]) + 1) for a, b in zip(starts, ends, strict=True)]
+
+
+def trim_hairpins(paths, *, radius: float, clearance: float | None = None,
+                  max_trim: float | None = None, min_length: float | None = None,
+                  extra: int = 0):
+    """Cut the path where it turns tighter than the bead, and pull the ends apart.
+
+    A toolpath off a stripe field turns back on itself at the end of every
+    stripe, and some of those turns are tighter than the bead is wide.  Printed,
+    that is not a turn: the nozzle lays material on material and leaves a blob,
+    and it is also what makes a CAD solid of the bead self-intersect.  Measured
+    on a real part, 74% of the paths had at least one such turn.
+
+    So: split at each one, then walk the two new ends back until they stand
+    ``clearance`` apart, which is the gap the bead needs in order not to
+    overlap.  Nothing is moved -- only dropped -- so every vertex that survives
+    is still exactly where the optimiser put it.
+
+    Parameters
+    ----------
+    radius : float
+        Turns tighter than this are hairpins, in the mesh's units.  The bead's
+        half-width is the physical choice.
+    clearance : float, optional
+        How far apart to pull the two cut ends.  Defaults to ``2 * radius`` --
+        one bead width, so the two bead ends meet without overlapping.
+    max_trim : float, optional
+        Give up walking back after this much arc length on each side and cut
+        anyway.  Defaults to ``5 * clearance``.  It bounds the damage when the
+        two legs stay close for a long way, which is a path that was going to
+        print badly whatever is done to it.
+    extra : int
+        Drop this many further vertices from each side once ``clearance`` is
+        met.  The clearance test is satisfied the moment the two ends are far
+        enough apart, which on a gentle turn is barely past the apex and leaves
+        the two beads still running alongside each other.  Two or three extra
+        vertices open it properly.  ``max_trim`` still bounds the total.
+    min_length : float, optional
+        Drop pieces shorter than this.  Defaults to ``clearance`` -- a stub
+        shorter than the bead is wide is a dot of plastic and a travel move.
+
+    Returns
+    -------
+    list of :class:`Path`
+        In path order, each piece keeping its parent's kind.  Expect more paths
+        out than in; run :func:`order_paths` afterwards, since the sequence has
+        changed.
+
+    Notes
+    -----
+    Run this **after** :func:`connect`, never before.  The gap it opens is one
+    bead wide and ``connect`` is given a tolerance of several millimetres, so
+    running it the other way round welds every cut straight back together.
+
+    Measured on a real part -- 106 paths, 63161 mm, a 2 mm bead:
+
+    .. code-block:: text
+
+                           paths    length   travel   tight turns
+        as printed           106   63161mm   3050mm            78
+        hairpins trimmed     252   62154mm   3944mm             0
+
+    1.6% of the path length and 29% more travel, for a bead that never crosses
+    itself.  The path count is the real cost: 146 more stops and starts, each
+    one a retraction and a restart.  Whether that trade is worth making is a
+    print decision, which is why this is a separate step and not something
+    :func:`extract_paths` does on its own.
+
+    The cut lands on whichever vertex the sampling provided, which is often
+    further from the neighbour than it needs to be and sometimes closer.
+    :func:`spread_ends` places it properly afterwards.
+
+    See Also
+    --------
+    turn_radius : the measure this thresholds, to see what a part is carrying.
+    """
+    if radius <= 0:
+        raise ValueError(f"radius must be positive, got {radius}")
+    clearance = 2.0 * radius if clearance is None else clearance
+    max_trim = 5.0 * clearance if max_trim is None else max_trim
+    min_length = clearance if min_length is None else min_length
+
+    out: list[Path] = []
+    for path in _as_paths(paths):
+        for piece in _split_hairpins(onp.asarray(path.nodes, dtype=float),
+                                     radius, clearance, max_trim, path.is_closed,
+                                     extra):
+            candidate = Path(piece, path.kind, path.path_id)
+            if candidate.length >= min_length:
+                out.append(candidate)
+    return out
+
+
+def _split_hairpins(nodes, radius, clearance, max_trim, closed=False, extra=0):
+    """Pieces of one polyline, cut and trimmed at every turn tighter than ``radius``."""
+    if len(nodes) < 3:
+        return [nodes]
+    if closed and len(nodes) > 3:
+        # `turn_radius` reads interior vertices only, so the turn *at* the seam
+        # is the one vertex it never sees -- and a hairpin sitting there would
+        # survive the whole operation.  Rolling the seam onto the gentlest turn
+        # puts every sharp one where it can be found.  A closed path has no
+        # first vertex in any real sense, so this costs nothing.
+        gentle = int(onp.argmax(turn_radius(nodes))) + 1
+        core = nodes[:-1]
+        nodes = onp.vstack([onp.roll(core, -gentle, axis=0), core[gentle][None]])
+    tight = turn_radius(nodes) < radius
+    runs = _runs(tight)
+    if not runs:
+        return [nodes]
+
+    # One cut per run of tight vertices, at its middle.  +1 converts a
+    # turn_radius index (interior vertices) to a node index.
+    cuts = [((lo + hi) // 2) + 1 for lo, hi in runs]
+
+    step = onp.concatenate([[0.0], onp.cumsum(
+        onp.linalg.norm(onp.diff(nodes, axis=0), axis=1))])
+    pieces, start = [], 0
+    for cut in cuts:
+        left, right = _pull_apart(nodes, step, cut, clearance, max_trim, extra)
+        if left > start:
+            pieces.append(nodes[start:left + 1])
+        start = right
+    pieces.append(nodes[start:])
+    pieces = [p for p in pieces if len(p) >= 2]
+
+    if closed and len(pieces) >= 2:
+        # The seam is not a cut.  A closed path repeats its first vertex at the
+        # end, so the last piece runs straight into the first one through it --
+        # emitted separately they are two paths whose ends sit on top of each
+        # other, which is the opposite of what the trimming is for.
+        pieces = [onp.vstack([pieces[-1][:-1], pieces[0]])] + pieces[1:-1]
+    return pieces
+
+
+def _pull_apart(nodes, step, cut, clearance, max_trim, extra=0):
+    """Walk out from ``cut`` until the two ends stand ``clearance`` apart.
+
+    Symmetric in arc length rather than in index, so an unevenly sampled turn
+    is not trimmed harder on whichever side happens to carry more vertices.
+
+    The walk stops one vertex short of each end of the polyline.  Running it to
+    the very end would leave a one-vertex piece, which is not a path at all --
+    whether the remaining stub is worth printing is ``min_length``'s decision
+    to make, not a side effect of where the walk happened to stop.
+    """
+    lo, hi = 1, len(nodes) - 2
+    left = right = cut
+    while onp.linalg.norm(nodes[right] - nodes[left]) < clearance:
+        moved_left = step[cut] - step[left]
+        moved_right = step[right] - step[cut]
+        if min(moved_left, moved_right) >= max_trim:
+            break
+        can_left, can_right = left > lo, right < hi
+        if not (can_left or can_right):
+            break
+        if can_left and (moved_left <= moved_right or not can_right):
+            left -= 1
+        else:
+            right += 1
+
+    # `extra` is counted after the clearance is met, and still inside the same
+    # bounds: never past the ends of the polyline, never past `max_trim`.
+    for _ in range(max(extra, 0)):
+        if left > lo and step[cut] - step[left - 1] <= max_trim:
+            left -= 1
+        if right < hi and step[right + 1] - step[cut] <= max_trim:
+            right += 1
+    return left, right
+
+
+def spread_ends(paths, *, move: float, radius: float | None = None,
+                skip: float | None = None, samples: int = 72):
+    """Nudge each free end into the clearest space around it.
+
+    :func:`trim_hairpins` can only stop at a vertex, so a cut end lands wherever
+    the sampling happened to put one -- often still closer to its neighbour than
+    it needs to be.  This moves it, by at most ``move``, to the point that
+    maximises the summed distance to the material around it.
+
+    The objective is a sum of distances, which is **convex** in the position, so
+    its maximum over any disc is on the rim: the end always moves the full
+    ``move``, in the direction that leads away from the surrounding nodes.
+    ``move`` is therefore not a bound that is sometimes reached -- it is the
+    step length, and it is the one number that decides how far the geometry may
+    depart from the optimiser's own curve.
+
+    Every point within ``radius`` counts the same, near or far, since each
+    contributes one unit vector to the gradient.  That is what "sum of
+    distances" means; if what you want is clearance, keep ``radius`` close to
+    the pitch so distant stripes cannot outvote the neighbour that matters.
+
+    Parameters
+    ----------
+    move : float
+        How far an end may travel, in the mesh's units.  A fraction of the bead
+        width is the sane range; past that the end leaves the path the
+        optimiser designed.
+    radius : float, optional
+        Only nodes within this distance are "around it".  Defaults to
+        ``10 * move``.
+    skip : float, optional
+        Ignore nodes of the end's **own** path within this arc length of it.
+        Defaults to ``radius``.  Without it the end simply runs forward along
+        its own tail, undoing the trim that put it there.
+    samples : int
+        Directions tried around the rim.  The objective is smooth, so 72 (every
+        5 degrees) resolves the optimum to well under a tenth of ``move``.
+
+    Returns
+    -------
+    list of :class:`Path`
+        Same count, same order, same kinds.  Only the first and last vertex of
+        each open path can differ; closed paths are returned untouched, since
+        they have no free end to move and shifting one would break the loop.
+
+    Notes
+    -----
+    This is the one operation here that puts a vertex where the optimiser did
+    not. :func:`simplify` and :func:`trim_hairpins` only ever drop vertices.
+
+    Measured on a real part after trimming -- 252 paths, a 2 mm bead, a 0.2 mm
+    step -- against the distance from each free end to the nearest material
+    that is not its own:
+
+    .. code-block:: text
+
+                        min gap     p5    ends closer than the bead
+        trimmed          1.559mm  1.91mm                      7.1%
+        + spread_ends    1.759mm  2.03mm                      1.6%
+
+    7 ms for the lot.  No solver: the maximum of a convex function over a disc
+    is on its rim, so the rim is all that is searched.
+    """
+    if move <= 0:
+        raise ValueError(f"move must be positive, got {move}")
+    radius = 10.0 * move if radius is None else radius
+    skip = radius if skip is None else skip
+    items = _as_paths(paths)
+    if not items:
+        return []
+
+    from scipy.spatial import cKDTree
+
+    nodes = [onp.asarray(p.nodes, dtype=float) for p in items]
+    cloud = onp.vstack(nodes)
+    owner = onp.concatenate([onp.full(len(q), i) for i, q in enumerate(nodes)])
+    arc = onp.concatenate([
+        onp.concatenate([[0.0], onp.cumsum(onp.linalg.norm(onp.diff(q, axis=0), axis=1))])
+        for q in nodes])
+    tree = cKDTree(cloud)
+
+    angles = onp.linspace(0.0, 2.0 * onp.pi, samples, endpoint=False)
+    rim = move * onp.stack([onp.cos(angles), onp.sin(angles)], axis=1)
+
+    out = []
+    for i, path in enumerate(items):
+        q = nodes[i].copy()
+        if len(q) >= 2 and not path.is_closed:
+            total = arc[onp.flatnonzero(owner == i)][-1]
+            for end, own_arc in ((0, 0.0), (len(q) - 1, total)):
+                near = tree.query_ball_point(q[end], radius)
+                if not near:
+                    continue
+                near = onp.asarray(near)
+                mine = owner[near] == i
+                keep = ~(mine & (onp.abs(arc[near] - own_arc) < skip))
+                if not keep.any():
+                    continue
+                around = cloud[near[keep]]
+                # Convex objective: the best point on the rim is the answer, so
+                # only the rim is searched.
+                dist = onp.linalg.norm(
+                    (q[end] + rim)[:, None, :] - around[None, :, :], axis=-1)
+                q[end] = q[end] + rim[int(onp.argmax(dist.sum(axis=1)))]
+        out.append(Path(q, path.kind, path.path_id))
+    return out
+
+
+def _laplacian_step(q, closed, weight):
+    """One pass of ``x += weight * (neighbour mean - x)``."""
+    if closed:
+        core = q[:-1]
+        mean = 0.5 * (onp.roll(core, 1, axis=0) + onp.roll(core, -1, axis=0))
+        core = core + weight * (mean - core)
+        return onp.vstack([core, core[:1]])
+    out = q.copy()
+    mean = 0.5 * (q[:-2] + q[2:])
+    out[1:-1] = q[1:-1] + weight * (mean - q[1:-1])
+    return out
+
+
+def smooth(paths, *, iterations: int = 10, lam: float = 0.5,
+           mu: float | None = None):
+    """Taubin smoothing: take the stair-steps out without shrinking the loop.
+
+    A contour off a grid is a staircase — marching squares can only put a
+    vertex on a cell edge, so a boundary crossing the grid at a shallow angle
+    comes back as a flight of steps one cell high.  Printed, every step is a
+    direction change the machine has to decelerate through.
+
+    Plain Laplacian smoothing takes the steps out and the area with them: it is
+    diffusion, and a closed loop under diffusion shrinks towards a point.  That
+    matters here because the perimeter's offset is deliberate.  Taubin's fix is
+    to follow each smoothing pass with a slightly larger negative one, which
+    undoes the shrinkage while leaving the high-frequency removal in place.
+
+    Parameters
+    ----------
+    iterations : int
+        Number of λ/μ pairs.  Cost is linear; the effect saturates.
+    lam : float
+        The smoothing weight, in ``(0, 1)``.
+    mu : float, optional
+        The un-shrinking weight, negative and larger in magnitude than ``lam``.
+        Defaults to Taubin's rule ``1 / (k - 1 / lam)`` with a pass band of
+        ``k = 0.1``, which leaves wavelengths longer than about twenty vertices
+        alone and removes what is shorter.  For ``lam = 0.5`` that is -0.526.
+
+    Returns
+    -------
+    list of :class:`Path`
+        Same count, same order, same kinds.  Closed paths stay closed, and an
+        open path keeps both its endpoints exactly.
+
+    Notes
+    -----
+    This moves vertices, so run it before anything that measures the path, and
+    follow it with :func:`simplify` — smoothing makes the polyline much easier
+    to describe with fewer points than it arrived with.
+    """
+    if not 0.0 < lam < 1.0:
+        raise ValueError(f"lam must lie in (0, 1), got {lam}")
+    if mu is None:
+        mu = 1.0 / (0.1 - 1.0 / lam)
+    if mu >= 0.0:
+        raise ValueError(f"mu must be negative, got {mu}")
+
+    out = []
+    for path in _as_paths(paths):
+        q = onp.asarray(path.nodes, dtype=float).copy()
+        if len(q) >= 4:
+            closed = path.is_closed
+            for _ in range(max(int(iterations), 0)):
+                q = _laplacian_step(q, closed, lam)
+                q = _laplacian_step(q, closed, mu)
+        out.append(Path(q, path.kind, path.path_id))
+    return out
+
+
+def _rdp_keep(points, tolerance: float):
+    """Ramer-Douglas-Peucker: which vertices to keep, as a boolean mask.
+
+    Iterative rather than recursive -- a contour off a fine mesh runs to a few
+    thousand vertices, and the worst case recurses once per vertex.
+    """
+    n = len(points)
+    keep = onp.zeros(n, dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        span = points[j] - points[i]
+        length = float(onp.hypot(*span))
+        rel = points[i + 1:j] - points[i]
+        if length <= 1e-30:
+            # A closed path starts and ends at the same vertex, so the first
+            # split has no chord at all; distance to the point is the measure.
+            d = onp.hypot(rel[:, 0], rel[:, 1])
+        else:
+            d = onp.abs(rel[:, 0] * span[1] - rel[:, 1] * span[0]) / length
+        k = int(onp.argmax(d))
+        if d[k] > tolerance:
+            k += i + 1
+            keep[k] = True
+            stack.append((i, k))
+            stack.append((k, j))
+    return keep
+
+
+def simplify(paths, *, tolerance: float) -> list[Path]:
+    """Drop vertices that no one would miss, keeping the shape to ``tolerance``.
+
+    Contours come off the stripe mesh at roughly one vertex per element, which
+    is far more than the geometry needs: a straight run through a member is
+    hundreds of collinear points.  This removes a vertex whenever doing so moves
+    the polyline by less than ``tolerance``, so the error is bounded everywhere
+    rather than on average.
+
+    Use it before writing a file, not before measuring.  Spacing and travel are
+    properties of the curve and survive it, but anything that counts nodes --
+    :func:`path_lengths` is fine, a per-node statistic is not -- sees a
+    different sampling afterwards.
+
+    Parameters
+    ----------
+    paths : sequence of :class:`Path` or of ``(n, 2)`` arrays
+    tolerance : float
+        Maximum distance, **in the mesh's units**, that the simplified polyline
+        may sit from the original.  At print scale the useful range is well
+        under the nozzle: 0.02 mm is invisible, 0.1 mm starts to flatten tight
+        corners.
+
+    Returns
+    -------
+    list of :class:`Path`
+        Same order, same kinds, same endpoints.  Closed paths stay closed: the
+        shared first and last vertex is always kept.
+    """
+    if tolerance < 0:
+        raise ValueError(f"tolerance must not be negative, got {tolerance}")
+    out = []
+    for path in _as_paths(paths):
+        nodes = onp.asarray(path.nodes, dtype=float)
+        if len(nodes) <= 2 or tolerance == 0:
+            out.append(path)
+            continue
+        out.append(Path(nodes[_rdp_keep(nodes, tolerance)].copy(),
+                        path.kind, path.path_id))
+    return out
+
+
+#: SI prefixes STEP names, for the length unit the file declares.
+_STEP_UNITS = {"m": "$", "mm": ".MILLI.", "cm": ".CENTI.", "um": ".MICRO."}
+
+
+def _step_real(v: float) -> str:
+    """STEP reals must carry a point: ``1`` is an integer, ``1.`` is a real."""
+    t = f"{v:.10g}"
+    return t if ("." in t or "e" in t or "E" in t) else t + "."
+
+
+def _step_text(t: str) -> str:
+    """A STEP string literal.  Quotes double; control characters are refused."""
+    if any(ord(c) < 32 for c in t):
+        raise ValueError(f"{t!r} cannot go in a STEP string: control characters")
+    return "'" + t.replace("'", "''") + "'"
+
+
+def write_step(paths, filename, *, scale: float = 1000.0, units: str = "mm",
+               z: float = 0.0, name: str = "toolpath") -> None:
+    """Write paths to STEP (AP214 ``automotive_design``) as wireframe curves.
+
+    AP214 rather than AP203 because every CAD package reads it and it is the
+    more permissive of the two about geometry that bounds no solid, which is
+    all a toolpath ever is.
+
+    Each path becomes one ``POLYLINE`` and each ``kind`` one named
+    ``GEOMETRIC_CURVE_SET``, so the grouping matches :func:`write_svg`'s groups
+    and :func:`write_dxf`'s layers.  As with DXF, a run that has been through
+    :func:`connect` exports as it prints: the welded bridges are interior
+    vertices like any other.
+
+    This is curves, not solids.  STEP's reason for existing is boundary
+    representation, and a toolpath is not one -- what it is good for here is
+    bringing the paths into CAD beside the part model to measure and to draw.
+    A bead swept into a solid is a different file and needs a geometry kernel.
+
+    One vertex becomes one ``CARTESIAN_POINT`` entity, so the file is large in
+    proportion to the sampling.  Run :func:`simplify` first: on a real part it
+    removes ~95% of the vertices while moving the curve less than the tolerance
+    you name.
+
+    Parameters
+    ----------
+    scale : float
+        Mesh units to file units, default metres to millimetres.
+    units : {"mm", "m", "cm", "um"}
+        The length unit the file **declares**.  STEP records this, unlike DXF,
+        so it has to agree with ``scale`` -- the default pair does.
+    z : float
+        Plane to place the curves on, in file units.  One layer per file; STEP
+        has no notion of a print layer.
+    name : str
+        Product name, which is what CAD shows in its tree.
+
+    See Also
+    --------
+    write_dxf : the same curves in DXF R12, if the receiving tool prefers it.
+    simplify : thin the vertices first.
+    """
+    if units not in _STEP_UNITS:
+        raise ValueError(f"units must be one of {sorted(_STEP_UNITS)}, got {units!r}")
+    items = _as_paths(paths)
+    if not items:
+        warnings.warn("writing a STEP file with no paths", stacklevel=2)
+    groups = by_kind(items)
+
+    lines: list[str] = []
+    nid = 0
+
+    def put(body: str) -> str:
+        """Append one entity instance and hand back its name."""
+        nonlocal nid
+        nid += 1
+        lines.append(f"#{nid}={body};")
+        return f"#{nid}"
+
+    # The AP203 product skeleton.  None of it is optional: a bare curve set
+    # with no product behind it loads as an empty assembly in most CAD.
+    ctx = put("APPLICATION_CONTEXT('automotive design')")
+    put(f"APPLICATION_PROTOCOL_DEFINITION('international standard',"
+        f"'automotive_design',2000,{ctx})")
+    pctx = put(f"PRODUCT_CONTEXT('',{ctx},'mechanical')")
+    prod = put(f"PRODUCT({_step_text(name)},{_step_text(name)},'',({pctx}))")
+    pdf = put("PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE('','',"
+              f"{prod},.NOT_KNOWN.)")
+    dctx = put(f"PRODUCT_DEFINITION_CONTEXT('part definition',{ctx},'design')")
+    pdef = put(f"PRODUCT_DEFINITION('design','',{pdf},{dctx})")
+    shape = put(f"PRODUCT_DEFINITION_SHAPE('','',{pdef})")
+
+    origin = put("CARTESIAN_POINT('',(0.,0.,0.))")
+    zdir = put("DIRECTION('',(0.,0.,1.))")
+    xdir = put("DIRECTION('',(1.,0.,0.))")
+    axis = put(f"AXIS2_PLACEMENT_3D('',{origin},{zdir},{xdir})")
+    length_unit = put(f"( LENGTH_UNIT() NAMED_UNIT(*) "
+                      f"SI_UNIT({_STEP_UNITS[units]},.METRE.) )")
+    angle_unit = put("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )")
+    solid_unit = put("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )")
+    tolerance = put(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),"
+                    f"{length_unit},'distance_accuracy_value','confusion accuracy')")
+    geo_ctx = put(f"( GEOMETRIC_REPRESENTATION_CONTEXT(3) "
+                  f"GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT(({tolerance})) "
+                  f"GLOBAL_UNIT_ASSIGNED_CONTEXT(({length_unit},{angle_unit},"
+                  f"{solid_unit})) REPRESENTATION_CONTEXT('','3D') )")
+
+    zs = _step_real(z)
+    sets = []
+    for kind, members in groups.items():
+        curves = []
+        for path in members:
+            # A closed path already repeats its first vertex, which is exactly
+            # how a STEP POLYLINE closes -- nothing to add or remove.
+            nodes = onp.asarray(path.nodes, dtype=float) * scale
+            pts = [put(f"CARTESIAN_POINT('',({_step_real(x)},{_step_real(y)},{zs}))")
+                   for x, y in nodes]
+            curves.append(put(f"POLYLINE('',({','.join(pts)}))"))
+        sets.append(put(f"GEOMETRIC_CURVE_SET({_step_text(kind)},"
+                        f"({','.join(curves)}))"))
+
+    rep = put(f"GEOMETRICALLY_BOUNDED_WIREFRAME_SHAPE_REPRESENTATION("
+              f"{_step_text(name)},({axis}{''.join(',' + s for s in sets)}),"
+              f"{geo_ctx})")
+    put(f"SHAPE_DEFINITION_REPRESENTATION({shape},{rep})")
+
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    desc = ", ".join(f"{len(v)} {k}" for k, v in groups.items()) or "empty"
+    header = [
+        "ISO-10303-21;",
+        "HEADER;",
+        f"FILE_DESCRIPTION(('print paths by kind: {desc}'),'2;1');",
+        f"FILE_NAME({_step_text(str(filename))},'{stamp}',(''),(''),"
+        "'path_optimizer','path_optimizer','');",
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));",
+        "ENDSEC;",
+        "DATA;",
+    ]
+    with open(filename, "w") as f:
+        f.write("\n".join(header) + "\n")
+        f.write("\n".join(lines))
+        f.write("\nENDSEC;\nEND-ISO-10303-21;\n")
 
 
 # ── FullControl handoff ──────────────────────────────────────────────────────

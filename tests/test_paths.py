@@ -312,6 +312,203 @@ def test_connect_keeps_the_first_piece_identity():
     assert joined[0].path_id is not None
 
 
+# ── Simplifying ──────────────────────────────────────────────────────────────
+
+def test_simplify_collapses_a_straight_run_to_its_ends():
+    # 20 collinear points carry the same information as 2.
+    out = P.simplify([line(0.0)], tolerance=1e-9)
+    assert len(out[0].nodes) == 2
+    assert out[0].nodes[0] == pytest.approx([0.0, 0.0])
+    assert out[0].nodes[-1] == pytest.approx([0.05, 0.0])
+
+
+def test_simplify_keeps_every_vertex_within_the_tolerance():
+    t = onp.linspace(0.0, 1.0, 400)
+    wiggly = onp.stack([t * 0.05, 0.002 * onp.sin(12.0 * t)], axis=1)
+    tol = 1e-4
+    out = P.simplify([wiggly], tolerance=tol)[0].nodes
+    assert len(out) < len(wiggly)
+
+    a, b = out[:-1], out[1:]
+    ab = b - a
+    ap = wiggly[:, None, :] - a[None, :, :]
+    u = onp.clip((ap * ab).sum(-1) / (ab * ab).sum(-1), 0.0, 1.0)
+    d = onp.linalg.norm(ap - u[..., None] * ab, axis=-1).min(axis=1)
+    assert d.max() <= tol
+
+
+def test_simplify_keeps_a_loop_closed():
+    out = P.simplify([loop()], tolerance=1e-4)[0]
+    assert out.is_closed
+    assert out.nodes[0] == pytest.approx(out.nodes[-1])
+    assert len(out.nodes) < len(loop())
+
+
+def test_simplify_preserves_order_kind_and_endpoints():
+    src = P.tag([line(0.0)], "a") + P.tag([loop()], "b")
+    out = P.simplify(src, tolerance=1e-4)
+    assert [p.kind for p in out] == ["a", "b"]
+    for got, want in zip(out, src, strict=True):
+        assert got.start == pytest.approx(want.start)
+        assert got.end == pytest.approx(want.end)
+
+
+def test_simplify_leaves_short_paths_and_zero_tolerance_alone():
+    two = onp.array([[0.0, 0.0], [0.01, 0.0]])
+    assert len(P.simplify([two], tolerance=1.0)[0].nodes) == 2
+    assert len(P.simplify([line(0.0)], tolerance=0.0)[0].nodes) == 20
+
+
+def test_simplify_rejects_a_negative_tolerance():
+    with pytest.raises(ValueError, match="must not be negative"):
+        P.simplify([line(0.0)], tolerance=-1e-6)
+
+
+def test_path_lengths_takes_path_objects_too():
+    src = [line(0.0, 0.0, 0.05)]
+    assert P.path_lengths(src) == pytest.approx([0.05])
+    assert P.path_lengths(P.tag(src, "a")) == pytest.approx([0.05])
+
+
+# ── Hairpins ─────────────────────────────────────────────────────────────────
+
+def hairpin(gap=0.0007, leg=0.03, n=16, spread=0.004, m=30):
+    """A half turn of radius ``gap/2`` with two legs running back out of it.
+
+    The legs diverge, as a stripe pattern's do: a pair that stayed exactly
+    parallel could never be pulled a bead's width apart, and trimming would
+    only ever hit its ``max_trim`` bound.
+    """
+    t = onp.linspace(-onp.pi / 2, onp.pi / 2, n)
+    turn = onp.stack([0.5 * gap * onp.cos(t), 0.5 * gap * onp.sin(t)], axis=1)
+    x = onp.linspace(0.0, -leg, m)
+    dy = onp.linspace(0.0, spread, m)
+    lower = onp.stack([x, -0.5 * gap - dy], axis=1)[::-1]
+    upper = onp.stack([x, 0.5 * gap + dy], axis=1)
+    return onp.vstack([lower, turn, upper])
+
+
+def test_turn_radius_matches_a_known_circle():
+    t = onp.linspace(0.0, 2.0 * onp.pi, 200)
+    circle = onp.stack([0.007 * onp.cos(t), 0.007 * onp.sin(t)], axis=1)
+    assert P.turn_radius(circle) == pytest.approx(0.007, rel=1e-3)
+    assert onp.isinf(P.turn_radius(line(0.0))).all()
+    assert len(P.turn_radius(onp.zeros((2, 2)))) == 0
+
+
+def test_trim_hairpins_cuts_the_turn_and_leaves_the_legs():
+    out = P.trim_hairpins([hairpin()], radius=0.001)
+    assert len(out) == 2
+    for piece in out:
+        assert P.turn_radius(piece.nodes).min(initial=onp.inf) >= 0.001
+    # Nothing moved: every surviving vertex is one of the originals.
+    src = {tuple(q) for q in hairpin()}
+    assert all(tuple(q) in src for piece in out for q in piece.nodes)
+
+
+def test_trim_hairpins_opens_a_gap_of_one_clearance():
+    out = P.trim_hairpins([hairpin()], radius=0.001, clearance=0.002)
+    assert len(out) == 2
+    assert onp.linalg.norm(out[1].start - out[0].end) >= 0.002
+
+
+def test_trim_hairpins_leaves_a_gentle_path_untouched():
+    t = onp.linspace(0.0, onp.pi, 60)
+    arc = onp.stack([0.01 * onp.cos(t), 0.01 * onp.sin(t)], axis=1)
+    out = P.trim_hairpins([arc], radius=0.001)
+    assert len(out) == 1
+    assert out[0].nodes == pytest.approx(arc)
+
+
+def test_trim_hairpins_keeps_the_kind_and_drops_stubs():
+    out = P.trim_hairpins(P.tag([hairpin()], "fibre"), radius=0.001)
+    assert {p.kind for p in out} == {"fibre"}
+    # A short leg is a dot of plastic plus a travel move, so it goes.
+    short = P.trim_hairpins([hairpin(leg=0.0008, spread=0.0002, m=4)],
+                            radius=0.001, min_length=0.01)
+    assert short == []
+
+
+def test_trim_hairpins_stops_trimming_at_max_trim():
+    # Legs that never reach the asked-for clearance must not be eaten whole:
+    # the walk-back is bounded and what is left still gets printed.
+    straight = hairpin(spread=0.0)
+    out = P.trim_hairpins([straight], radius=0.001, clearance=0.05,
+                          max_trim=0.002, min_length=0.0)
+    assert len(out) == 2
+    assert all(p.length > 0.02 for p in out)
+
+
+def test_trim_hairpins_rejects_a_non_positive_radius():
+    with pytest.raises(ValueError, match="radius must be positive"):
+        P.trim_hairpins([hairpin()], radius=0.0)
+
+
+def test_trim_hairpins_does_not_cut_a_closed_path_at_its_seam():
+    # A closed path repeats its first vertex, so the first and last pieces run
+    # into each other through it.  Emitted separately they would be two paths
+    # whose ends sit on top of each other -- 38 of them on a real part.  One
+    # hairpin, well away from the seam, therefore has to give back one piece.
+    t = onp.linspace(0.0, 2.0 * onp.pi, 121)
+    loop = onp.stack([0.01 * onp.cos(t), 0.01 * onp.sin(t)], axis=1)
+    loop[-1] = loop[0]
+    # A *shallow* spike is the sharp one: the turn radius goes as half the leg
+    # length, so pulling the vertex 1 mm in off a 10 mm circle gives ~0.5 mm,
+    # while pulling it 4 mm in gives 2 mm and is not a hairpin at all.
+    loop[60] = loop[60] * 0.9
+    assert P.Path(loop).is_closed
+    assert (P.turn_radius(loop) < 0.001).sum() > 0
+
+    out = P.trim_hairpins([loop], radius=0.001)
+    assert len(out) == 1
+    assert P.turn_radius(out[0].nodes).min(initial=onp.inf) >= 0.001
+
+
+def test_trim_hairpins_finds_a_hairpin_sitting_on_the_seam():
+    # `turn_radius` reads interior vertices, so a closed path whose sharpest
+    # turn is its own first vertex hides it from the threshold entirely.
+    t = onp.linspace(0.0, 2.0 * onp.pi, 61)
+    loop = onp.stack([0.01 * onp.cos(t), 0.01 * onp.sin(t)], axis=1)
+    loop[-1] = loop[0]
+    # Pinch the seam into a hairpin by pulling its neighbours in.
+    loop[1] = loop[0] + onp.array([0.0002, -0.0003])
+    loop[-2] = loop[0] + onp.array([0.0002, 0.0003])
+    out = P.trim_hairpins([loop], radius=0.001)
+    assert all(P.turn_radius(p.nodes).min(initial=onp.inf) >= 0.001 for p in out)
+
+
+# ── Placing the free ends ────────────────────────────────────────────────────
+
+def test_spread_ends_moves_an_end_away_from_its_neighbours():
+    # One path's end sits beside a wall of another's nodes; it must step away
+    # from the wall, not along it.
+    wall = onp.stack([onp.full(20, 0.001), onp.linspace(-0.01, 0.01, 20)], axis=1)
+    stub = onp.array([[-0.01, 0.0], [0.0, 0.0]])
+    out = P.spread_ends([stub, wall], move=0.0002, radius=0.01)
+    moved = out[0].end
+    assert moved[0] < stub[-1][0]                       # away from the wall
+    assert onp.linalg.norm(moved - stub[-1]) == pytest.approx(0.0002, rel=1e-2)
+
+
+def test_spread_ends_leaves_closed_paths_and_isolated_paths_alone():
+    out = P.spread_ends([loop()], move=0.0002)
+    assert out[0].nodes == pytest.approx(loop())
+    lonely = P.spread_ends([line(0.0)], move=0.0002, radius=1e-6)
+    assert lonely[0].nodes == pytest.approx(line(0.0))
+
+
+def test_spread_ends_ignores_the_ends_own_tail():
+    # Without `skip` the end runs forward along its own path, undoing the trim.
+    stub = onp.stack([onp.linspace(0.0, 0.01, 30), onp.zeros(30)], axis=1)
+    out = P.spread_ends([stub], move=0.0002, radius=0.02, skip=0.02)
+    assert out[0].nodes == pytest.approx(stub)
+
+
+def test_spread_ends_rejects_a_non_positive_move():
+    with pytest.raises(ValueError, match="move must be positive"):
+        P.spread_ends([line(0.0)], move=0.0)
+
+
 # ── SVG round trip ───────────────────────────────────────────────────────────
 
 def test_svg_round_trip_recovers_geometry_and_kind(tmp_path):
@@ -401,6 +598,212 @@ def test_read_svg_warns_about_what_it_skipped(tmp_path):
     with pytest.warns(UserWarning, match="polyline"):
         got = P.read_svg(svg)
     assert len(got) == 1                             # the curve is not a toolpath
+
+
+# ── DXF export ───────────────────────────────────────────────────────────────
+
+def dxf_pairs(text):
+    """DXF as a flat list of (group code, value) -- enough to check a writer."""
+    lines = text.splitlines()
+    return [(int(lines[i]), lines[i + 1]) for i in range(0, len(lines) - 1, 2)]
+
+
+def dxf_polylines(text):
+    """Layer name and vertex array for each POLYLINE, plus its closed flag."""
+    out, cur, layer, closed = [], None, None, False
+    for code, value in dxf_pairs(text):
+        if code == 0 and value == "POLYLINE":
+            cur, closed = [], False
+        elif code == 0 and value == "SEQEND":
+            out.append((layer, onp.array(cur, dtype=float), closed))
+            cur = None
+        elif cur is not None and code == 0 and value == "VERTEX":
+            cur.append([None, None])
+        elif cur is not None and code == 10:
+            cur[-1][0] = float(value)
+        elif cur is not None and code == 20:
+            cur[-1][1] = float(value)
+        elif cur is not None and not cur and code == 70:
+            closed = value == "1"
+        elif cur is not None and not cur and code == 8:
+            layer = value
+    return out
+
+
+def test_dxf_writes_one_polyline_per_path_without_the_y_flip(tmp_path):
+    src = [line(0.001 * k) for k in range(3)]
+    f = tmp_path / "p.dxf"
+    P.write_dxf(src, f)
+
+    got = dxf_polylines(f.read_text())
+    assert len(got) == 3
+    for (_, nodes, _), want in zip(got, src, strict=True):
+        # Metres to millimetres, y unchanged -- DXF counts y upward like the
+        # mesh, so unlike SVG there is nothing to undo.
+        assert nodes == pytest.approx(want * 1000.0, rel=1e-9, abs=1e-11)
+
+
+def test_dxf_gives_each_kind_its_own_layer(tmp_path):
+    f = tmp_path / "p.dxf"
+    P.write_dxf(P.tag([line(0.0)], "solid") + P.tag([line(0.002)], "outline"), f)
+
+    text = f.read_text()
+    assert [layer for layer, _, _ in dxf_polylines(text)] == ["solid", "outline"]
+    names = [v for i, (c, v) in enumerate(dxf_pairs(text))
+             if c == 2 and dxf_pairs(text)[i - 1] == (0, "LAYER")]
+    assert names == ["solid", "outline"]
+
+
+def test_dxf_closes_loops_with_the_flag_not_a_repeated_vertex(tmp_path):
+    f = tmp_path / "p.dxf"
+    P.write_dxf([loop()], f)
+
+    (_, nodes, closed), = dxf_polylines(f.read_text())
+    assert closed
+    # A repeated first vertex would leave CAM a zero-length segment.
+    assert len(nodes) == len(loop()) - 1
+    assert nodes[0] != pytest.approx(nodes[-1])
+
+
+def test_dxf_scale_is_honoured(tmp_path):
+    f = tmp_path / "p.dxf"
+    P.write_dxf([line(0.002)], f, scale=1.0)
+    (_, nodes, _), = dxf_polylines(f.read_text())
+    assert nodes == pytest.approx(line(0.002), rel=1e-9, abs=1e-11)
+
+
+def test_dxf_colours_cycle_per_kind_and_can_be_overridden(tmp_path):
+    f = tmp_path / "p.dxf"
+    P.write_dxf(P.tag([line(0.0)], "a") + P.tag([line(0.002)], "b"), f)
+    aci = [int(v) for c, v in dxf_pairs(f.read_text()) if c == 62]
+    assert aci == [P.KIND_ACI[0], P.KIND_ACI[1]]
+
+    P.write_dxf(P.tag([line(0.0)], "a") + P.tag([line(0.002)], "b"), f,
+                layer_colours={"a": 7, "b": 7})
+    assert [int(v) for c, v in dxf_pairs(f.read_text()) if c == 62] == [7, 7]
+
+    with pytest.raises(ValueError, match="no entry for"):
+        P.write_dxf(P.tag([line(0.0)], "a"), f, layer_colours={"b": 7})
+
+
+def test_dxf_rejects_a_kind_that_is_not_a_layer_name(tmp_path):
+    for bad in ("two words", "a/b", "", "x" * 32):
+        with pytest.raises(ValueError, match="DXF layer name"):
+            P.write_dxf([P.Path(line(0.0), bad)], tmp_path / "x.dxf")
+
+
+def test_dxf_warns_on_an_empty_drawing(tmp_path):
+    with pytest.warns(UserWarning, match="no paths"):
+        P.write_dxf([], tmp_path / "x.dxf")
+
+
+def test_dxf_keeps_a_connected_bridge_as_ordinary_geometry(tmp_path):
+    # `connect` welds two contours into one path; the bridge between them is a
+    # printed move, so it has to leave as vertices like any other.
+    joined = P.connect(P.tag([line(0.0), line(0.0005)[::-1]], "fibre"),
+                       tolerance=0.01)
+    assert len(joined) == 1
+    f = tmp_path / "p.dxf"
+    P.write_dxf(joined, f)
+
+    (_, nodes, _), = dxf_polylines(f.read_text())
+    assert nodes == pytest.approx(joined[0].nodes * 1000.0, rel=1e-9, abs=1e-11)
+
+
+# ── STEP export ──────────────────────────────────────────────────────────────
+
+def step_instances(text):
+    """``{"#7": ("POLYLINE", "...params...")}`` -- enough to check a writer."""
+    out = {}
+    for raw in text.splitlines():
+        if not raw.startswith("#") or "=" not in raw:
+            continue
+        ref, body = raw.split("=", 1)
+        body = body.rstrip(";")
+        if "(" not in body:
+            continue
+        name, _, params = body.partition("(")
+        out[ref] = (name, params.rsplit(")", 1)[0])
+    return out
+
+
+def step_points(text, poly_ref):
+    """The xyz of each CARTESIAN_POINT a POLYLINE refers to, in order."""
+    inst = step_instances(text)
+    refs = inst[poly_ref][1].split("(", 1)[1].rstrip(")").split(",")
+    return onp.array([
+        [float(v) for v in inst[r.strip()][1].split("(")[1].rstrip(")").split(",")]
+        for r in refs])
+
+
+def test_step_writes_one_polyline_per_path_at_the_given_z(tmp_path):
+    src = [line(0.001 * k) for k in range(3)]
+    f = tmp_path / "p.step"
+    P.write_step(src, f, z=0.2)
+
+    text = f.read_text()
+    polys = [r for r, (n, _) in step_instances(text).items() if n == "POLYLINE"]
+    assert len(polys) == 3
+    for ref, want in zip(polys, src, strict=True):
+        xyz = step_points(text, ref)
+        assert xyz[:, :2] == pytest.approx(want * 1000.0, rel=1e-9, abs=1e-11)
+        assert xyz[:, 2] == pytest.approx(0.2)
+
+
+def test_step_gives_each_kind_its_own_curve_set(tmp_path):
+    f = tmp_path / "p.step"
+    P.write_step(P.tag([line(0.0)], "solid") + P.tag([line(0.002)], "outline"), f)
+    sets = [params for _, (n, params) in step_instances(f.read_text()).items()
+            if n == "GEOMETRIC_CURVE_SET"]
+    assert len(sets) == 2
+    assert sets[0].startswith("'solid'") and sets[1].startswith("'outline'")
+
+
+def test_step_declares_the_unit_it_was_scaled_to(tmp_path):
+    f = tmp_path / "p.step"
+    P.write_step([line(0.0)], f)
+    assert "SI_UNIT(.MILLI.,.METRE.)" in f.read_text()
+
+    P.write_step([line(0.0)], f, scale=1.0, units="m")
+    assert "SI_UNIT($,.METRE.)" in f.read_text()
+
+    with pytest.raises(ValueError, match="units must be one of"):
+        P.write_step([line(0.0)], f, units="inch")
+
+
+def test_step_reals_always_carry_a_decimal_point(tmp_path):
+    # `1` is an integer in Part 21 and a conforming reader rejects it where a
+    # real is required, so a whole-number coordinate has to come out as `1.`.
+    f = tmp_path / "p.step"
+    P.write_step([onp.array([[0.001, 0.002], [0.003, 0.004]])], f)
+    for nm, params in step_instances(f.read_text()).values():
+        if nm == "CARTESIAN_POINT":
+            for v in params.split("(")[1].rstrip(")").split(","):
+                assert "." in v or "E" in v.upper(), v
+
+
+def test_step_has_the_product_skeleton_cad_needs(tmp_path):
+    f = tmp_path / "p.step"
+    P.write_step([line(0.0)], f, name="beam")
+    names = {n for n, _ in step_instances(f.read_text()).values()}
+    assert {"PRODUCT", "PRODUCT_DEFINITION", "SHAPE_DEFINITION_REPRESENTATION",
+            "GEOMETRICALLY_BOUNDED_WIREFRAME_SHAPE_REPRESENTATION",
+            "APPLICATION_PROTOCOL_DEFINITION"} <= names
+    text = f.read_text()
+    assert text.startswith("ISO-10303-21;")
+    assert text.rstrip().endswith("END-ISO-10303-21;")
+    assert "'beam'" in text
+
+
+def test_step_escapes_a_quote_in_a_kind(tmp_path):
+    f = tmp_path / "p.step"
+    P.write_step([P.Path(line(0.0), "o'brien")], f)
+    assert "'o''brien'" in f.read_text()
+
+
+def test_step_warns_on_an_empty_drawing(tmp_path):
+    with pytest.warns(UserWarning, match="no paths"):
+        P.write_step([], tmp_path / "x.step")
 
 
 # ── FullControl handoff ──────────────────────────────────────────────────────

@@ -43,6 +43,10 @@ dependencies = [
 
 [project.optional-dependencies]
 jax = ["jax[cuda13]"]
+# path_optimizer.solids only. OpenCASCADE is a large binary wheel and the one
+# geometry kernel in the tree; the toolpath itself exports to SVG, DXF and
+# wireframe STEP with nothing extra.
+solids = ["cadquery-ocp", "pyvista"]
 sksparse = ["scikit-sparse"]
 # Smoothed-aggregation AMG preconditioning on GPU (see Dockerfile).
 amg = ["amjax", "pyamg"]
@@ -111,6 +115,12 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+# Notebooks are read a cell at a time, so they are written tighter than library
+# code: `ax.set_title(...); ax.set_ylabel(...)` on one line, a lambda where a
+# def would cost three. Lint them for real errors, not for house style.
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E702", "E731", "B905"]
 
 [tool.mypy]
 python_version = "3.11"
