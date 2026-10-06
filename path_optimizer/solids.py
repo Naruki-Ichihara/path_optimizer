@@ -49,7 +49,7 @@ from path_optimizer.paths import _as_paths, turn_radius
 #: Re-exported from :mod:`path_optimizer.paths` -- the same measure decides
 #: whether a bead can follow a path and whether it needs trimming first.
 __all__ = ["BeadReport", "bead_compound", "write_step_solid", "turn_radius",
-           "read_step", "tessellate", "to_pyvista", "plot"]
+           "read_step", "tessellate", "to_pyvista", "to_plotly", "plot"]
 
 
 _OCC_HINT = (
@@ -409,8 +409,8 @@ def tessellate(shape, *, deflection: float = 0.05, angle: float = 0.5):
 
     Parameters
     ----------
-    shape : TopoDS_Shape
-        From :func:`bead_compound` or :func:`read_step`.
+    shape : TopoDS_Shape or path
+        From :func:`bead_compound`, or a STEP file, which is read first.
     deflection : float
         Greatest distance the triangles may sit from the true surface, in the
         shape's own units.  A bead's flat faces are exact at any value; this
@@ -430,6 +430,8 @@ def tessellate(shape, *, deflection: float = 0.05, angle: float = 0.5):
     from OCP.TopLoc import TopLoc_Location
     from OCP.TopoDS import TopoDS
 
+    if isinstance(shape, (str, os.PathLike)):
+        shape = read_step(shape)
     BRepMesh_IncrementalMesh(shape, float(deflection), False, float(angle), True)
 
     points: list[onp.ndarray] = []
@@ -485,8 +487,6 @@ def to_pyvista(shape, *, deflection: float = 0.05, angle: float = 0.5):
             "then restart the kernel."
         ) from exc
 
-    if isinstance(shape, (str, os.PathLike)):
-        shape = read_step(shape)
     vertices, triangles = tessellate(shape, deflection=deflection, angle=angle)
     if not len(triangles):
         return pv.PolyData()
@@ -505,10 +505,53 @@ def _in_notebook() -> bool:
         "ZMQInteractiveShell", "Shell")          # Jupyter, Colab
 
 
+#: Eye directions for the named views, in units of the scene's own size.
+_EYE = {"iso": (1.4, -1.4, 1.1), "xy": (0.0, 0.0, 2.2),
+        "xz": (0.0, -2.2, 0.0), "yz": (2.2, 0.0, 0.0)}
+
+
+def to_plotly(shape, *, deflection: float = 0.05, angle: float = 0.5,
+              color: str = "#2a78d6", view: str = "iso",
+              background: str = "#fcfcfb", flatshading: bool = True):
+    """The shape as a :class:`plotly.graph_objects.Figure`.
+
+    The same tessellation as :func:`to_pyvista`, in the library the rest of the
+    notebook already draws with.  Plotly renders in the page from data the cell
+    carries, so unlike PyVista's interactive backends it needs no server to
+    reach -- which is what makes it the one that works on Colab.
+
+    The whole mesh travels into the output: 181k triangles came to 10.7 MB of
+    inline HTML.  ``deflection`` is the knob, and it is worth turning on a
+    large part.
+    """
+    import plotly.graph_objects as go
+
+    if view not in _EYE:
+        raise ValueError(
+            f"view must be one of {sorted(_EYE)}; got {view!r}")
+    vertices, triangles = tessellate(shape, deflection=deflection, angle=angle)
+    eye = _EYE[view]
+    fig = go.Figure(go.Mesh3d(
+        x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
+        i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2],
+        color=color, flatshading=flatshading, hoverinfo="skip"))
+    blank = dict(showbackground=False, showgrid=False, showticklabels=False,
+                 zeroline=False, title="")
+    fig.update_layout(
+        # aspectmode="data" keeps the part's proportions; anything else
+        # stretches a long beam to fill a cube.
+        scene=dict(xaxis=blank, yaxis=blank, zaxis=blank, aspectmode="data",
+                   camera=dict(eye=dict(x=eye[0], y=eye[1], z=eye[2]),
+                               projection=dict(type="orthographic"))),
+        paper_bgcolor=background, margin=dict(l=0, r=0, t=0, b=0),
+        showlegend=False)
+    return fig
+
+
 def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
          color: str = "#2a78d6", view: str = "iso", zoom: float = 1.0,
-         window_size=(1600, 900), show_edges: bool = False,
-         background: str = "#fcfcfb", screenshot=None,
+         engine: str | None = None, window_size=(1600, 900),
+         show_edges: bool = False, background: str = "#fcfcfb", screenshot=None,
          jupyter_backend: str | None = None, **kwargs):
     """Open PyVista's viewer on the beads.
 
@@ -516,15 +559,13 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
     appears in the output cell, rendered by trame, which ``pyvista[jupyter]``
     brings in and which this package installs.
 
-    In a notebook the backend defaults to ``"html"`` and the viewer itself is
-    returned, so it becomes the cell's output and renders there.  That backend
-    embeds the scene in the output and vtk.js draws it in the page: the mouse
-    works against a local renderer, with no server and no GPU on the kernel.
-
-    The other interactive backends do not survive Colab.  ``"client"`` and
-    ``"server"`` both point the page at a trame server on localhost, which a
-    Colab notebook cannot reach -- the cell comes back "connection refused" and
-    prints the plotter's repr instead of showing anything.
+    In a notebook this draws with **Plotly** and returns the figure, so the cell
+    renders it.  Outside one it opens a PyVista window.  Plotly because it
+    renders from data the cell carries and needs nothing to connect to, which
+    is the difference that matters: PyVista's interactive backends all point
+    the page at a trame server on localhost, and a Colab notebook cannot reach
+    it -- the cell comes back "connection refused" and shows nothing.  Pass
+    ``engine="pyvista"`` to insist, on a kernel that can serve it.
 
     .. code-block:: python
 
@@ -533,11 +574,9 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         solids.plot("beads.step")                     # straight from the file
         solids.plot(compound, view="xy", show_edges=True)
 
-    The scene travels into the notebook, so ``deflection`` decides both how
-    responsive the viewer is and how large the saved ``.ipynb`` becomes: 0.2 mm
-    put a metre-long beam at 162k triangles.  ``jupyter_backend="static"`` drops
-    to a still image, which is also what to use when the notebook has to read
-    correctly with no kernel behind it.
+    Either way the scene travels into the notebook, so ``deflection`` decides
+    both how responsive the viewer is and how large the saved ``.ipynb``
+    becomes: 181k triangles came to 10.7 MB of inline HTML.
 
     Parameters
     ----------
@@ -556,7 +595,12 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         either way: under perspective the paths at the far side of a metre-long
         part look finer than the ones in front, and they are not.
     zoom : float
-        Applied once the camera has been fitted to the part.
+        Applied once the camera has been fitted to the part.  PyVista only;
+        Plotly fits the part and leaves the zoom to the mouse.
+    engine : {"plotly", "pyvista"}, optional
+        ``None`` means Plotly in a notebook and PyVista outside one, which is
+        where each works.  ``screenshot`` forces PyVista, since saving a Plotly
+        figure as an image needs kaleido on top.
     show_edges : bool
         Draw the triangle edges.  Off by default -- the tessellation's edges
         are not the part's, and at this scale they fill the picture.
@@ -564,18 +608,31 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         Save to this file instead of opening the viewer.  For a machine with no
         display; PyVista needs ``PYVISTA_OFF_SCREEN=true`` or an X server.
     jupyter_backend : str, optional
-        Passed to PyVista's ``show``.  ``None`` means ``"html"`` in a notebook
-        and PyVista's own choice outside one.  ``"static"`` gives a still
-        image.  ``"client"`` and ``"server"`` need a reachable trame server and
-        do not work on Colab.
+        PyVista engine only.  ``None`` means ``"html"`` in a notebook, which is
+        the one PyVista backend that embeds the scene instead of serving it;
+        ``"static"`` gives a still image.  ``"client"`` and ``"server"`` need a
+        reachable trame server and do not work on Colab.
 
     Returns
     -------
-    viewer or :class:`pyvista.Plotter`
-        In a notebook, the viewer -- which is what has to be the cell's value
-        for it to render.  Otherwise the plotter, after showing or saving, so a
-        caller can take the camera or add to the scene.
+    figure, viewer or :class:`pyvista.Plotter`
+        Whatever has to be the cell's value for it to render: a Plotly figure,
+        or a PyVista viewer.  Outside a notebook, the plotter, after showing or
+        saving, so a caller can take the camera or add to the scene.
     """
+    notebook = _in_notebook()
+    if engine is None:
+        engine = "pyvista" if screenshot is not None or not notebook else "plotly"
+    if engine not in ("plotly", "pyvista"):
+        raise ValueError(
+            f"engine must be 'plotly' or 'pyvista'; got {engine!r}")
+    if engine == "plotly":
+        if screenshot is not None:
+            raise ValueError("screenshot needs engine='pyvista'")
+        fig = to_plotly(shape, deflection=deflection, angle=angle, color=color,
+                        view=view, background=background, **kwargs)
+        return fig if notebook else fig.show()
+
     import pyvista as pv
 
     mesh = to_pyvista(shape, deflection=deflection, angle=angle)
@@ -600,7 +657,6 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         plotter.close()
         return plotter
 
-    notebook = _in_notebook()
     if jupyter_backend is None and notebook:
         jupyter_backend = "html"
     if notebook:
