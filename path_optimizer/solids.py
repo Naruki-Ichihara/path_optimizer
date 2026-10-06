@@ -494,6 +494,17 @@ def to_pyvista(shape, *, deflection: float = 0.05, angle: float = 0.5):
     return pv.PolyData(vertices, cells)
 
 
+def _in_notebook() -> bool:
+    """True inside a Jupyter/Colab kernel, false in a plain interpreter."""
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    shell = get_ipython()
+    return shell is not None and shell.__class__.__name__ in (
+        "ZMQInteractiveShell", "Shell")          # Jupyter, Colab
+
+
 def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
          color: str = "#2a78d6", view: str = "iso", zoom: float = 1.0,
          window_size=(1600, 900), show_edges: bool = False,
@@ -505,6 +516,12 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
     appears in the output cell, rendered by trame, which ``pyvista[jupyter]``
     brings in and which this package installs.
 
+    In a notebook the backend defaults to ``"client"``, which ships the
+    triangles to the browser and lets vtk.js draw them: the mouse then works
+    against a local renderer, with no round trip and no GPU on the kernel.
+    PyVista's own default resolves to a still image on Colab, which is a
+    picture of the part rather than a view of it.
+
     .. code-block:: python
 
         from path_optimizer import solids
@@ -512,10 +529,11 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         solids.plot("beads.step")                     # straight from the file
         solids.plot(compound, view="xy", show_edges=True)
 
-    A notebook with no GPU -- Colab's default, and any remote kernel -- renders
-    on the server and streams frames, so a large part is slow to steer.
-    ``deflection`` is the knob for that, and ``jupyter_backend="static"`` drops
-    to a still image.
+    What the browser has to hold is the whole tessellation, so ``deflection`` is
+    the knob that decides whether it stays responsive: 0.2 mm put a metre-long
+    beam at 162k triangles, which is comfortable.  ``jupyter_backend="server"``
+    renders on the kernel and streams frames instead, which suits a part too
+    large to ship, and ``"static"`` drops to a still image.
 
     Parameters
     ----------
@@ -542,10 +560,11 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         Save to this file instead of opening the viewer.  For a machine with no
         display; PyVista needs ``PYVISTA_OFF_SCREEN=true`` or an X server.
     jupyter_backend : str, optional
-        Passed to PyVista's ``show``.  ``None`` lets it choose: trame in a
-        notebook, a window otherwise.  ``"static"`` gives a still image, which
-        is what to reach for when the stream is too slow to steer, or when the
-        notebook has to read correctly after it is re-opened without a kernel.
+        Passed to PyVista's ``show``.  ``None`` means ``"client"`` in a
+        notebook and PyVista's own choice outside one.  ``"server"`` renders on
+        the kernel and streams frames; ``"static"`` gives a still image, which
+        is what to reach for when the notebook has to read correctly after it
+        is re-opened without a kernel.
 
     Returns
     -------
@@ -575,7 +594,11 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
     if screenshot is not None:
         plotter.screenshot(str(screenshot))
         plotter.close()
-    elif jupyter_backend is not None:
+        return plotter
+
+    if jupyter_backend is None and _in_notebook():
+        jupyter_backend = "client"
+    if jupyter_backend is not None:
         plotter.show(jupyter_backend=jupyter_backend)
     else:
         plotter.show()
