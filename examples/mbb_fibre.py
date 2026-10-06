@@ -615,12 +615,20 @@ def main():
     # would open a gap in the wall, which is worse than the overlap it avoids.
     fibre = [p for p in thin if p.kind != "outline"]
     rim = [p for p in thin if p.kind == "outline"]
-    # `extra` drops three more vertices each side once the clearance is met:
-    # the test is satisfied just past the apex, where the two beads still run
-    # alongside each other.  It took the beads OCC could not build from 5 to 1,
-    # at the same travel.
+    # `extra` drops five more vertices each side once the clearance is met: the
+    # test is satisfied just past the apex, where the two beads still run
+    # alongside each other.  Measured here, with and without the perimeter:
+    #
+    #     PERIMETER  extra  fill  length   travel  invalid
+    #       True       3     105  61654mm  4010mm        0 (one repaired)
+    #       True       5     108  61530mm  4313mm        0
+    #       False      3     106  61459mm  3137mm        1
+    #       False      5     112  61345mm  2844mm        2
+    #
+    # 5 suits the default -- nothing invalid and nothing needing repair, for 8%
+    # more travel.  With PERIMETER off, 3 is the better of the two.
     trimmed = paths.order_paths(
-        paths.trim_hairpins(fibre, radius=0.5 * bead, extra=3))
+        paths.trim_hairpins(fibre, radius=0.5 * bead, extra=5))
     # The cut lands on whatever vertex was there; this places it in the
     # clearest space within a tenth of a bead width.
     trimmed = paths.spread_ends(trimmed, move=0.1 * bead)
