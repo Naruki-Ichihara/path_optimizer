@@ -181,6 +181,15 @@ CONNECT_TOLERANCE = 5.0e-3   # m
 # for the same bridge quality, and 15 mm starts welding across the voids.
 REJOIN_TOLERANCE = 10.0e-3   # m
 
+# Print a perimeter around the part as well as filling it.  The fill is cut
+# back to make room: a perimeter whose centre line sits half a bead inside the
+# edge reaches one bead in, so the fill has to start further than that.
+# PERIMETER_CLEARANCE is where it starts, in bead widths.  1.5 is the geometric
+# minimum; measured on this part it still left 2.0% of the outline within a
+# bead width of the fill at concave corners, and 2.0 left nothing touching.
+PERIMETER = True
+PERIMETER_CLEARANCE = 2.0
+
 # Height of the extruded bead in the CAD solid (`beads.step`) only -- the
 # g-code still uses LAYER_HEIGHT.  A single 0.2 mm layer is invisible beside
 # a 1 m beam, so the solid is written at the thickness the part is meant to
@@ -552,6 +561,33 @@ def main():
           f"{paths.travel_distance(final) * 1e3:.0f} mm")
     ordered = final
 
+    # ── Perimeter ──
+    # The outline is a level set of the distance to the boundary, not a
+    # displaced polygon, so it cannot cross itself: where the part is narrower
+    # than the bead the loop closes up, which is the right answer.  Smoothing
+    # comes first because marching squares can only put a vertex on a cell edge
+    # -- the contour arrives as a staircase -- and Taubin holds the area while
+    # it takes the steps out.
+    #
+    # Moving the perimeter inwards would not get it clear of the fill, since
+    # the fill is everywhere; the fill is cut back instead, as a slicer does.
+    bead = EXTRUSION_WIDTH * 1e-3
+    if PERIMETER:
+        outline = paths.tag(
+            paths.extract_region_contours(field, offset=0.5 * bead), "outline")
+        outline = paths.order_paths(paths.simplify(
+            paths.smooth(outline, iterations=30), tolerance=CAD_TOLERANCE))
+        fill = paths.order_paths(paths.clip_to_region(
+            ordered, field, inset=PERIMETER_CLEARANCE * bead))
+        fill = paths.order_paths(paths.connect(fill, tolerance=CONNECT_TOLERANCE))
+        ordered = fill + outline
+        print(f"perimeter: {len(fill)} fill + {len(outline)} outline, "
+              f"fill {sum(p.length for p in fill) * 1e3:.0f} mm, "
+              f"outline {sum(p.length for p in outline) * 1e3:.0f} mm")
+    else:
+        outline = []
+        print("perimeter: off, the fill runs to the boundary")
+
     # ── CAD handoff ──
     # The same sequenced toolpath in the two formats CAD and CAM read, so it can
     # be laid over the part model, measured, or drawn.  `connect` has already
@@ -575,13 +611,16 @@ def main():
     # one bead wide and CONNECT_TOLERANCE would weld it shut again.
     from path_optimizer import solids
 
-    bead = EXTRUSION_WIDTH * 1e-3
+    # Only the fill is trimmed; the perimeter is left whole, since cutting it
+    # would open a gap in the wall, which is worse than the overlap it avoids.
+    fibre = [p for p in thin if p.kind != "outline"]
+    rim = [p for p in thin if p.kind == "outline"]
     # `extra` drops three more vertices each side once the clearance is met:
     # the test is satisfied just past the apex, where the two beads still run
     # alongside each other.  It took the beads OCC could not build from 5 to 1,
     # at the same travel.
     trimmed = paths.order_paths(
-        paths.trim_hairpins(thin, radius=0.5 * bead, extra=3))
+        paths.trim_hairpins(fibre, radius=0.5 * bead, extra=3))
     # The cut lands on whatever vertex was there; this places it in the
     # clearest space within a tenth of a bead width.
     trimmed = paths.spread_ends(trimmed, move=0.1 * bead)
@@ -591,10 +630,9 @@ def main():
     # Refusing those also shortened the travel, 3584 mm to 3137 mm -- they were
     # awkward joins to sequence.
     trimmed = paths.order_paths(paths.connect(
-        trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True))
-    print(f"hairpins: {len(thin)} -> {len(trimmed)} paths, "
-          f"travel {paths.travel_distance(thin) * 1e3:.0f} -> "
-          f"{paths.travel_distance(trimmed) * 1e3:.0f} mm")
+        trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True)) + rim
+    print(f"hairpins: {len(fibre)} -> {len(trimmed) - len(rim)} fill paths"
+          + (f" + {len(rim)} outline" if rim else ""))
 
     f = OUT / "beads.step"
     report = solids.write_step_solid(
