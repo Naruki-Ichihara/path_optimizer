@@ -21,8 +21,11 @@ The swept region is what the printer actually deposits there -- the material
 simply overlaps -- and it is always a valid area.
 
 This is the only part of :mod:`path_optimizer` that needs a geometry kernel.
-OpenCASCADE arrives through ``cadquery-ocp``; nothing else here imports it, and
-it is loaded on first use so the rest of the package runs without it.
+OpenCASCADE arrives through ``cadquery-ocp`` and is installed with the package:
+it ships manylinux wheels for every Python a notebook is likely to be running,
+so there is no build step even on Colab.  It is still imported on first use
+rather than at module scope, so an installation that somehow lacks it fails
+where it is used and not on ``import path_optimizer``.
 
 .. note::
 
@@ -50,12 +53,11 @@ __all__ = ["BeadReport", "bead_compound", "write_step_solid", "turn_radius",
 
 
 _OCC_HINT = (
-    "path_optimizer.solids needs OpenCASCADE, which is not installed.\n"
+    "path_optimizer.solids needs OpenCASCADE, which is not importable.\n"
     "    pip install cadquery-ocp\n"
-    "It is a large binary wheel and the only dependency in this package that "
-    "needs a geometry kernel, which is why it is not installed by default. "
-    "For the toolpath as curves rather than solids, paths.write_step and "
-    "paths.write_dxf need nothing extra."
+    "It installs with path_optimizer, so finding it missing means the install "
+    "was partial or the wrong environment is active. For the toolpath as curves "
+    "rather than solids, paths.write_step and paths.write_dxf need no kernel."
 )
 
 
@@ -465,13 +467,7 @@ def to_pyvista(shape, *, deflection: float = 0.05, angle: float = 0.5):
 
     ``shape`` may also be a path to a STEP file, which is read first.
     """
-    try:
-        import pyvista as pv
-    except ImportError as exc:                        # pragma: no cover
-        raise ImportError(
-            "path_optimizer.solids.to_pyvista needs pyvista:\n"
-            "    pip install pyvista"
-        ) from exc
+    import pyvista as pv
 
     if isinstance(shape, (str, os.PathLike)):
         shape = read_step(shape)
@@ -483,37 +479,63 @@ def to_pyvista(shape, *, deflection: float = 0.05, angle: float = 0.5):
 
 
 def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
-         color: str = "#2a78d6", screenshot=None, window_size=(1600, 900),
-         view: str = "xy", zoom: float = 1.0, show_edges: bool = False,
-         background: str = "#fcfcfb", **kwargs):
-    """Show the beads, or write a picture of them.
+         color: str = "#2a78d6", view: str = "iso", zoom: float = 1.0,
+         window_size=(1600, 900), show_edges: bool = False,
+         background: str = "#fcfcfb", screenshot=None,
+         jupyter_backend: str | None = None, **kwargs):
+    """Open PyVista's viewer on the beads.
+
+    Interactive: rotate, pan, section, measure.  In a notebook the viewer
+    appears in the output cell, rendered by trame, which ``pyvista[jupyter]``
+    brings in and which this package installs.
+
+    .. code-block:: python
+
+        from path_optimizer import solids
+
+        solids.plot("beads.step")                     # straight from the file
+        solids.plot(compound, view="xy", show_edges=True)
+
+    A notebook with no GPU -- Colab's default, and any remote kernel -- renders
+    on the server and streams frames, so a large part is slow to steer.
+    ``deflection`` is the knob for that, and ``jupyter_backend="static"`` drops
+    to a still image.
 
     Parameters
     ----------
     shape : TopoDS_Shape or path
-        A shape, or a STEP file to read.
+        A shape from :func:`bead_compound`, or a STEP file, which is read first.
+    deflection : float
+        Tessellation tolerance, in the shape's units.  The flat faces are exact
+        whatever it is; this is how finely the round ends are cut.  Loosen it on
+        a large part -- 0.2 mm took a 1 m beam to 162k triangles in 1.8 s.
     color : str
         One colour for the whole part.  Toolpath beads are one material and one
-        process; colouring them separately would say something that is not so.
-    screenshot : path, optional
-        Render off screen to this file instead of opening a window.  Needed on
-        a machine with no display, which is most of the ones this runs on.
-    view : {"xy", "iso", "xz", "yz"}
-        Camera.  ``"xy"`` looks straight down, which is how a toolpath is read;
-        ``"iso"`` shows the extrusion.  Projection is parallel either way --
-        perspective makes paths at the far side of a 1 m part look finer than
-        the ones in front, which they are not.
+        process; colouring them apart would say something that is not so.
+    view : {"iso", "xy", "xz", "yz"}
+        Starting camera.  ``"iso"`` shows the extrusion, ``"xy"`` looks
+        straight down, which is how a toolpath is read.  Projection is parallel
+        either way: under perspective the paths at the far side of a metre-long
+        part look finer than the ones in front, and they are not.
     zoom : float
-        Applied after the camera is fitted to the part.  Above 1 crops in.
+        Applied once the camera has been fitted to the part.
     show_edges : bool
-        Draw the triangle edges.  Off by default: the tessellation's edges are
-        not the part's, and at this scale they fill the picture.
+        Draw the triangle edges.  Off by default -- the tessellation's edges
+        are not the part's, and at this scale they fill the picture.
+    screenshot : path, optional
+        Save to this file instead of opening the viewer.  For a machine with no
+        display; PyVista needs ``PYVISTA_OFF_SCREEN=true`` or an X server.
+    jupyter_backend : str, optional
+        Passed to PyVista's ``show``.  ``None`` lets it choose: trame in a
+        notebook, a window otherwise.  ``"static"`` gives a still image, which
+        is what to reach for when the stream is too slow to steer, or when the
+        notebook has to read correctly after it is re-opened without a kernel.
 
     Returns
     -------
     :class:`pyvista.Plotter`
-        Already shown or already saved; returned so a caller can take the
-        camera or add to the scene.
+        After showing or saving, so a caller can take the camera or add to the
+        scene.
     """
     import pyvista as pv
 
@@ -524,14 +546,21 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
     plotter.add_mesh(mesh, color=color, show_edges=show_edges,
                      smooth_shading=False, **kwargs)
     plotter.enable_parallel_projection()
-    {"xy": plotter.view_xy, "xz": plotter.view_xz, "yz": plotter.view_yz,
-     "iso": plotter.view_isometric}[view]()
+    try:
+        {"xy": plotter.view_xy, "xz": plotter.view_xz, "yz": plotter.view_yz,
+         "iso": plotter.view_isometric}[view]()
+    except KeyError:
+        raise ValueError(
+            f"view must be one of 'iso', 'xy', 'xz', 'yz'; got {view!r}") from None
     plotter.reset_camera()
     if zoom != 1.0:
         plotter.camera.zoom(zoom)
+
     if screenshot is not None:
         plotter.screenshot(str(screenshot))
         plotter.close()
+    elif jupyter_backend is not None:
+        plotter.show(jupyter_backend=jupyter_backend)
     else:
         plotter.show()
     return plotter

@@ -39,14 +39,19 @@ dependencies = [
     # (numpy / plotly / pydantic) are JAX-free, so it is safe to resolve normally
     # inside the container.
     "fullcontrol @ git+https://github.com/FullControlXYZ/fullcontrol",
+    # path_optimizer.solids: the bead solids and their STEP, and the viewer that
+    # shows them. A geometry kernel is a heavy thing to require -- the OCP wheel
+    # is 67 MB and VTK is larger -- but both resolve to manylinux wheels on the
+    # Pythons Colab runs (cp311-cp314), so a notebook gets them from `pip
+    # install path_optimizer` without a build step, and neither touches JAX.
+    # `pyvista[jupyter]` rather than bare pyvista: the extra is trame, which is
+    # what makes the viewer interactive in a notebook instead of a static PNG.
+    "cadquery-ocp",
+    "pyvista[jupyter]",
 ]
 
 [project.optional-dependencies]
 jax = ["jax[cuda13]"]
-# path_optimizer.solids only. OpenCASCADE is a large binary wheel and the one
-# geometry kernel in the tree; the toolpath itself exports to SVG, DXF and
-# wireframe STEP with nothing extra.
-solids = ["cadquery-ocp", "pyvista"]
 sksparse = ["scikit-sparse"]
 # Smoothed-aggregation AMG preconditioning on GPU (see Dockerfile).
 amg = ["amjax", "pyamg"]

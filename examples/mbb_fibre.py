@@ -566,44 +566,40 @@ def main():
               f"{f.stat().st_size / 1024:.0f} kB)")
 
     # ── Solids ──
-    # The same toolpath as the material it deposits, in B-rep.  Optional: it is
-    # the one thing here that needs a geometry kernel, and the curve files
-    # above are already written.
+    # The same toolpath as the material it deposits, in B-rep.
     #
     # Hairpins are trimmed first.  A turn tighter than the bead's half-width is
     # not a turn the printer can make -- it lays material over material -- and
     # it is also what makes the solid self-intersect.  On this part it was 78
-    # of 106 paths; trimming costs 1.6% of the path length and a third more
-    # travel, and leaves every bead buildable.  After `connect`, never before:
-    # the gap is one bead wide and CONNECT_TOLERANCE would weld it shut again.
-    try:
-        from path_optimizer import solids
-        bead = EXTRUSION_WIDTH * 1e-3
-        # `extra` drops three more vertices each side once the clearance is
-        # met: the test is satisfied just past the apex, where the two beads
-        # still run alongside each other.  It took the beads OCC could not
-        # build from 5 to 1, at the same travel.
-        trimmed = paths.order_paths(
-            paths.trim_hairpins(thin, radius=0.5 * bead, extra=3))
-        # The cut lands on whatever vertex was there; this places it in the
-        # clearest space within a tenth of a bead width.
-        trimmed = paths.spread_ends(trimmed, move=0.1 * bead)
-        # Then weld what the trimming broke apart, to win the travel back.
-        # `no_cross` because a bridge is a straight line through whatever
-        # lies between the two ends: at 10 mm, three of them cut across
-        # other paths.  Refusing those also shortened the travel, from
-        # 3584 mm to 3137 mm -- they were awkward joins to sequence.
-        trimmed = paths.order_paths(paths.connect(
-            trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True))
-        print(f"hairpins: {len(thin)} -> {len(trimmed)} paths, "
-              f"travel {paths.travel_distance(thin) * 1e3:.0f} -> "
-              f"{paths.travel_distance(trimmed) * 1e3:.0f} mm")
-        f = OUT / "beads.step"
-        report = solids.write_step_solid(
-            trimmed, f, width=EXTRUSION_WIDTH, height=SOLID_HEIGHT)
-        print(f"Wrote {f} ({report}, {f.stat().st_size / 1e6:.0f} MB)")
-    except ImportError as exc:
-        print(f"Skipping beads.step -- {exc}")
+    # of 106 paths.  After `connect`, never before: the gap trimming opens is
+    # one bead wide and CONNECT_TOLERANCE would weld it shut again.
+    from path_optimizer import solids
+
+    bead = EXTRUSION_WIDTH * 1e-3
+    # `extra` drops three more vertices each side once the clearance is met:
+    # the test is satisfied just past the apex, where the two beads still run
+    # alongside each other.  It took the beads OCC could not build from 5 to 1,
+    # at the same travel.
+    trimmed = paths.order_paths(
+        paths.trim_hairpins(thin, radius=0.5 * bead, extra=3))
+    # The cut lands on whatever vertex was there; this places it in the
+    # clearest space within a tenth of a bead width.
+    trimmed = paths.spread_ends(trimmed, move=0.1 * bead)
+    # Then weld what the trimming broke apart, to win the travel back.
+    # `no_cross` because a bridge is a straight line through whatever lies
+    # between the two ends: at 10 mm, three of them cut across other paths.
+    # Refusing those also shortened the travel, 3584 mm to 3137 mm -- they were
+    # awkward joins to sequence.
+    trimmed = paths.order_paths(paths.connect(
+        trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True))
+    print(f"hairpins: {len(thin)} -> {len(trimmed)} paths, "
+          f"travel {paths.travel_distance(thin) * 1e3:.0f} -> "
+          f"{paths.travel_distance(trimmed) * 1e3:.0f} mm")
+
+    f = OUT / "beads.step"
+    report = solids.write_step_solid(
+        trimmed, f, width=EXTRUSION_WIDTH, height=SOLID_HEIGHT)
+    print(f"Wrote {f} ({report}, {f.stat().st_size / 1e6:.0f} MB)")
 
     # ── FullControl design ──
     # A design is a plain list of FullControl step objects, not a file format:
