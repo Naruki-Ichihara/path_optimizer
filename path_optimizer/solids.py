@@ -516,11 +516,15 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
     appears in the output cell, rendered by trame, which ``pyvista[jupyter]``
     brings in and which this package installs.
 
-    In a notebook the backend defaults to ``"client"``, which ships the
-    triangles to the browser and lets vtk.js draw them: the mouse then works
-    against a local renderer, with no round trip and no GPU on the kernel.
-    PyVista's own default resolves to a still image on Colab, which is a
-    picture of the part rather than a view of it.
+    In a notebook the backend defaults to ``"html"`` and the viewer itself is
+    returned, so it becomes the cell's output and renders there.  That backend
+    embeds the scene in the output and vtk.js draws it in the page: the mouse
+    works against a local renderer, with no server and no GPU on the kernel.
+
+    The other interactive backends do not survive Colab.  ``"client"`` and
+    ``"server"`` both point the page at a trame server on localhost, which a
+    Colab notebook cannot reach -- the cell comes back "connection refused" and
+    prints the plotter's repr instead of showing anything.
 
     .. code-block:: python
 
@@ -529,11 +533,11 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         solids.plot("beads.step")                     # straight from the file
         solids.plot(compound, view="xy", show_edges=True)
 
-    What the browser has to hold is the whole tessellation, so ``deflection`` is
-    the knob that decides whether it stays responsive: 0.2 mm put a metre-long
-    beam at 162k triangles, which is comfortable.  ``jupyter_backend="server"``
-    renders on the kernel and streams frames instead, which suits a part too
-    large to ship, and ``"static"`` drops to a still image.
+    The scene travels into the notebook, so ``deflection`` decides both how
+    responsive the viewer is and how large the saved ``.ipynb`` becomes: 0.2 mm
+    put a metre-long beam at 162k triangles.  ``jupyter_backend="static"`` drops
+    to a still image, which is also what to use when the notebook has to read
+    correctly with no kernel behind it.
 
     Parameters
     ----------
@@ -560,17 +564,17 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         Save to this file instead of opening the viewer.  For a machine with no
         display; PyVista needs ``PYVISTA_OFF_SCREEN=true`` or an X server.
     jupyter_backend : str, optional
-        Passed to PyVista's ``show``.  ``None`` means ``"client"`` in a
-        notebook and PyVista's own choice outside one.  ``"server"`` renders on
-        the kernel and streams frames; ``"static"`` gives a still image, which
-        is what to reach for when the notebook has to read correctly after it
-        is re-opened without a kernel.
+        Passed to PyVista's ``show``.  ``None`` means ``"html"`` in a notebook
+        and PyVista's own choice outside one.  ``"static"`` gives a still
+        image.  ``"client"`` and ``"server"`` need a reachable trame server and
+        do not work on Colab.
 
     Returns
     -------
-    :class:`pyvista.Plotter`
-        After showing or saving, so a caller can take the camera or add to the
-        scene.
+    viewer or :class:`pyvista.Plotter`
+        In a notebook, the viewer -- which is what has to be the cell's value
+        for it to render.  Otherwise the plotter, after showing or saving, so a
+        caller can take the camera or add to the scene.
     """
     import pyvista as pv
 
@@ -596,8 +600,14 @@ def plot(shape, *, deflection: float = 0.05, angle: float = 0.5,
         plotter.close()
         return plotter
 
-    if jupyter_backend is None and _in_notebook():
-        jupyter_backend = "client"
+    notebook = _in_notebook()
+    if jupyter_backend is None and notebook:
+        jupyter_backend = "html"
+    if notebook:
+        # Returned, not shown: a widget renders because it is the cell's value.
+        # Calling show() and then returning the plotter prints its repr and
+        # nothing else.
+        return plotter.show(jupyter_backend=jupyter_backend, return_viewer=True)
     if jupyter_backend is not None:
         plotter.show(jupyter_backend=jupyter_backend)
     else:
