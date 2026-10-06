@@ -184,11 +184,16 @@ REJOIN_TOLERANCE = 10.0e-3   # m
 # Print a perimeter around the part as well as filling it.  The fill is cut
 # back to make room: a perimeter whose centre line sits half a bead inside the
 # edge reaches one bead in, so the fill has to start further than that.
-# PERIMETER_CLEARANCE is where it starts, in bead widths.  1.5 is the geometric
-# minimum; measured on this part it still left 2.0% of the outline within a
-# bead width of the fill at concave corners, and 2.0 left nothing touching.
+#
+# PERIMETER_CLEARANCE is where the fill's centre line starts, measured from the
+# boundary in bead widths, so the air between the two beads is
+# PERIMETER_CLEARANCE - 1.5 of them: 1.5 has them touching, 2.0 leaves half a
+# bead, 2.5 leaves a whole one.  Nominal, not guaranteed -- at 2.0 the closest
+# the outline came to the fill was 1.896 mm against a 2 mm bead, well under the
+# 3 mm the centre lines are nominally apart, because a concave corner pulls the
+# outline towards the fill's cut ends.  2.5 is the default for that reason.
 PERIMETER = True
-PERIMETER_CLEARANCE = 2.0
+PERIMETER_CLEARANCE = 2.5
 
 # Height of the extruded bead in the CAD solid (`beads.step`) only -- the
 # g-code still uses LAYER_HEIGHT.  A single 0.2 mm layer is invisible beside
