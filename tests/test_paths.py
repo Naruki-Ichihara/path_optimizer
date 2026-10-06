@@ -662,25 +662,41 @@ def test_csv_round_trips_geometry_kind_and_order(tmp_path):
     assert back[-1].is_closed
 
 
-def test_csv_needs_no_out_of_band_scale(tmp_path):
+def test_csv_needs_no_out_of_band_units(tmp_path):
     f = tmp_path / "p.csv"
-    P.write_csv([line(0.002)], f, scale=1.0, units="m")
+    P.write_csv([line(0.002)], f, units="m")
+    assert "# units=m" in f.read_text()
     assert P.read_csv(f)[0].nodes == pytest.approx(line(0.002), abs=1e-9)
 
+    P.write_csv([line(0.002)], f, units="cm")
+    assert P.read_csv(f)[0].nodes == pytest.approx(line(0.002), abs=1e-9)
 
-def test_csv_without_a_scale_header_warns(tmp_path):
+    with pytest.raises(ValueError, match="units must be one of"):
+        P.write_csv([line(0.0)], f, units="furlong")
+
+
+def test_csv_without_a_units_header_warns(tmp_path):
     f = tmp_path / "p.csv"
     f.write_text("path,kind,seq,x,y\n0,fibre,0,0,0\n0,fibre,1,1,0\n")
-    with pytest.warns(UserWarning, match="no `scale` header"):
+    with pytest.warns(UserWarning, match="no `units` header"):
         back = P.read_csv(f)
     assert back[0].nodes == pytest.approx(onp.array([[0.0, 0.0], [1.0, 0.0]]))
+
+
+def test_csv_with_unknown_units_is_refused(tmp_path):
+    f = tmp_path / "p.csv"
+    f.write_text("# units=furlong\npath,kind,seq,x,y\n0,a,0,0,0\n0,a,1,1,0\n")
+    with pytest.raises(ValueError, match="not one of"):
+        P.read_csv(f)
 
 
 def test_csv_header_records_the_units(tmp_path):
     f = tmp_path / "p.csv"
     P.write_csv([line(0.0)], f)
     head = f.read_text().splitlines()[:3]
-    assert head[1] == "# scale=1000.0  units=mm"
+    # Units and nothing else: `scale=1000` read to a person as either
+    # "multiply by 1000" or "1:1000", and meant neither.
+    assert head[1] == "# units=mm"
     assert head[2] == "path,kind,seq,x,y"
 
 
@@ -698,7 +714,7 @@ def test_csv_keeps_the_row_order_it_was_given(tmp_path):
     # `seq` is for a reader, not for the parser: sorting on it would quietly
     # repair a shuffled file, and a shuffled toolpath is not a toolpath.
     f = tmp_path / "p.csv"
-    f.write_text("# scale=1\npath,kind,seq,x,y\n"
+    f.write_text("# units=m\npath,kind,seq,x,y\n"
                  "0,a,5,2,0\n0,a,1,0,0\n")
     assert P.read_csv(f)[0].nodes == pytest.approx(onp.array([[2.0, 0.0], [0.0, 0.0]]))
 

@@ -75,6 +75,7 @@ __all__ = [
     "write_dxf",
     "write_csv",
     "read_csv",
+    "CSV_UNITS",
     "write_step",
     "KIND_ACI",
     "by_kind",
@@ -991,7 +992,13 @@ def read_svg(filename) -> list[Path]:
     return out
 
 
-def write_csv(paths, filename, *, scale: float = 1000.0, units: str = "mm",
+#: What one unit of each name is worth in the model's own units, which this
+#: package takes to be metres -- as every default in it does, ``write_svg``'s
+#: ``scale=1000`` included.
+CSV_UNITS = {"m": 1.0, "cm": 1e-2, "mm": 1e-3, "um": 1e-6, "in": 0.0254}
+
+
+def write_csv(paths, filename, *, units: str = "mm",
               z: float | None = None) -> None:
     """Write paths as plain coordinates, one vertex per row.
 
@@ -1002,47 +1009,48 @@ def write_csv(paths, filename, *, scale: float = 1000.0, units: str = "mm",
     .. code-block:: text
 
         # path_optimizer toolpath
-        # scale=1000  units=mm
+        # units=mm
         path,kind,seq,x,y
-        0,fibre,0,12.345,45.678
-        0,fibre,1,12.901,45.346
+        0,fibre,0,490.854,57.25
+        0,fibre,1,484.5,57.036
 
     What a coordinate dump usually loses is the three things that make a
     toolpath one: the order, the direction, and what each path is for.  Row
     order carries the first two -- within a ``path`` the rows run the way the
     head does -- and ``kind`` carries the third.
 
+    The header says the units and nothing else.  It used to record the
+    conversion factor as well, which was a mistake: ``scale=1000`` reads to a
+    person as either "multiply these by 1000" or "this is 1:1000", and neither
+    is what it meant.  ``units=mm`` can only be read one way, and
+    :func:`read_csv` works the factor out from it.
+
     This is a convention, not a standard; there is no standard for exchanging
-    toolpath coordinates.  The header says so in the only way that matters:
-    ``scale`` is written down, so :func:`read_csv` can undo it without being
-    told, and a reader who opens the file by hand can see which units they are
-    looking at before assuming millimetres.
+    toolpath coordinates.
 
     Parameters
     ----------
     paths : sequence of :class:`Path` or of ``(n, 2)`` arrays
-    scale : float
-        Mesh units to file units, default metres to millimetres.
     units : str
-        Recorded in the header.  It has to agree with ``scale`` -- nothing
-        here can check that, and a part built a thousand times too large is the
-        usual way of finding out.
+        What to write the coordinates in, from :data:`CSV_UNITS`.  The paths
+        themselves are taken to be in metres.
     z : float, optional
-        Adds a ``z`` column at this height, in file units.  Paths are plane
+        Adds a ``z`` column at this height, in the same units.  Paths are plane
         curves, so this is the layer they belong to, not geometry they carry.
 
     See Also
     --------
-    read_csv : reads it back, scale and kinds included.
+    read_csv : reads it back, units and kinds included.
     write_dxf : the same geometry for CAD, with kinds as layers.
     """
+    if units not in CSV_UNITS:
+        raise ValueError(f"units must be one of {sorted(CSV_UNITS)}, got {units!r}")
     items = _as_paths(paths)
     if not items:
         warnings.warn("writing a CSV with no paths", stacklevel=2)
+    scale = 1.0 / CSV_UNITS[units]
     head = ["path", "kind", "seq", "x", "y"] + (["z"] if z is not None else [])
-    lines = ["# path_optimizer toolpath",
-             f"# scale={scale!r}  units={units}",
-             ",".join(head)]
+    lines = ["# path_optimizer toolpath", f"# units={units}", ",".join(head)]
     zs = "" if z is None else f",{z:.10g}"
     for i, path in enumerate(items):
         if "," in path.kind or "\n" in path.kind:
@@ -1054,18 +1062,18 @@ def write_csv(paths, filename, *, scale: float = 1000.0, units: str = "mm",
 
 
 def read_csv(filename) -> list[Path]:
-    """Read back what :func:`write_csv` wrote, undoing the scale.
+    """Read back what :func:`write_csv` wrote, in the paths' own units.
 
-    The ``scale`` header is what makes this possible without being told the
-    units out of band.  A file without one is read as written, which is right
-    for a hand-made file in mesh units and wrong for one in millimetres -- so
-    it warns rather than guessing silently.
+    The ``units`` header is what makes this possible without being told them
+    out of band.  A file without one is read as written, which is right for a
+    hand-made file already in metres and wrong for one in millimetres -- so it
+    warns rather than guessing silently.
 
     Rows are taken in the order they appear.  ``seq`` is written for a reader's
     benefit and is not consulted: sorting on it would quietly repair a file
     whose rows had been shuffled, and a shuffled toolpath is not a toolpath.
     """
-    scale = None
+    units = None
     groups: dict[int, tuple[str, list[list[float]]]] = {}
     with open(filename) as f:
         for raw in f:
@@ -1074,8 +1082,8 @@ def read_csv(filename) -> list[Path]:
                 continue
             if line.startswith("#"):
                 for token in line[1:].split():
-                    if token.startswith("scale="):
-                        scale = float(token[len("scale="):])
+                    if token.startswith("units="):
+                        units = token[len("units="):]
                 continue
             if line.startswith("path,"):
                 continue
@@ -1085,21 +1093,26 @@ def read_csv(filename) -> list[Path]:
                 groups[index] = (kind, [])
             groups[index][1].append([float(cell[3]), float(cell[4])])
 
-    if scale is None:
+    if units is None:
         warnings.warn(
-            f"{filename} has no `scale` header, so its coordinates are taken as "
-            "they are; if it is in millimetres the paths will come back a "
+            f"{filename} has no `units` header, so its coordinates are taken as "
+            "metres; if the file is in millimetres the paths will come back a "
             "thousand times too large", stacklevel=2)
-        scale = 1.0
+        factor = 1.0
+    elif units not in CSV_UNITS:
+        raise ValueError(
+            f"{filename} is in {units!r}, which is not one of "
+            f"{sorted(CSV_UNITS)}")
+    else:
+        factor = CSV_UNITS[units]
 
     out = []
     for index in sorted(groups):
         kind, rows = groups[index]
-        nodes = onp.asarray(rows, dtype=float) / scale
+        nodes = onp.asarray(rows, dtype=float) * factor
         if len(nodes) >= 2:
             out.append(Path(nodes, kind, index))
     return out
-
 
 
 #: AutoCAD colour indices standing in for :data:`KIND_COLOURS`, in the same
