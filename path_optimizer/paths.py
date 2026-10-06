@@ -73,6 +73,8 @@ __all__ = [
     "write_svg",
     "read_svg",
     "write_dxf",
+    "write_csv",
+    "read_csv",
     "write_step",
     "KIND_ACI",
     "by_kind",
@@ -987,6 +989,117 @@ def read_svg(filename) -> list[Path]:
             f"skipped {skipped} <path> element(s): only <polyline> is read",
             stacklevel=2)
     return out
+
+
+def write_csv(paths, filename, *, scale: float = 1000.0, units: str = "mm",
+              z: float | None = None) -> None:
+    """Write paths as plain coordinates, one vertex per row.
+
+    For handing the geometry to someone rather than to a machine: it opens in a
+    spreadsheet, in pandas, in MATLAB, and in anything else that reads text,
+    with no library and no parser.
+
+    .. code-block:: text
+
+        # path_optimizer toolpath
+        # scale=1000  units=mm
+        path,kind,seq,x,y
+        0,fibre,0,12.345,45.678
+        0,fibre,1,12.901,45.346
+
+    What a coordinate dump usually loses is the three things that make a
+    toolpath one: the order, the direction, and what each path is for.  Row
+    order carries the first two -- within a ``path`` the rows run the way the
+    head does -- and ``kind`` carries the third.
+
+    This is a convention, not a standard; there is no standard for exchanging
+    toolpath coordinates.  The header says so in the only way that matters:
+    ``scale`` is written down, so :func:`read_csv` can undo it without being
+    told, and a reader who opens the file by hand can see which units they are
+    looking at before assuming millimetres.
+
+    Parameters
+    ----------
+    paths : sequence of :class:`Path` or of ``(n, 2)`` arrays
+    scale : float
+        Mesh units to file units, default metres to millimetres.
+    units : str
+        Recorded in the header.  It has to agree with ``scale`` -- nothing
+        here can check that, and a part built a thousand times too large is the
+        usual way of finding out.
+    z : float, optional
+        Adds a ``z`` column at this height, in file units.  Paths are plane
+        curves, so this is the layer they belong to, not geometry they carry.
+
+    See Also
+    --------
+    read_csv : reads it back, scale and kinds included.
+    write_dxf : the same geometry for CAD, with kinds as layers.
+    """
+    items = _as_paths(paths)
+    if not items:
+        warnings.warn("writing a CSV with no paths", stacklevel=2)
+    head = ["path", "kind", "seq", "x", "y"] + (["z"] if z is not None else [])
+    lines = ["# path_optimizer toolpath",
+             f"# scale={scale!r}  units={units}",
+             ",".join(head)]
+    zs = "" if z is None else f",{z:.10g}"
+    for i, path in enumerate(items):
+        if "," in path.kind or "\n" in path.kind:
+            raise ValueError(f"kind {path.kind!r} cannot go in a CSV column")
+        for seq, (x, y) in enumerate(onp.asarray(path.nodes, dtype=float) * scale):
+            lines.append(f"{i},{path.kind},{seq},{x:.10g},{y:.10g}{zs}")
+    with open(filename, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def read_csv(filename) -> list[Path]:
+    """Read back what :func:`write_csv` wrote, undoing the scale.
+
+    The ``scale`` header is what makes this possible without being told the
+    units out of band.  A file without one is read as written, which is right
+    for a hand-made file in mesh units and wrong for one in millimetres -- so
+    it warns rather than guessing silently.
+
+    Rows are taken in the order they appear.  ``seq`` is written for a reader's
+    benefit and is not consulted: sorting on it would quietly repair a file
+    whose rows had been shuffled, and a shuffled toolpath is not a toolpath.
+    """
+    scale = None
+    groups: dict[int, tuple[str, list[list[float]]]] = {}
+    with open(filename) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                for token in line[1:].split():
+                    if token.startswith("scale="):
+                        scale = float(token[len("scale="):])
+                continue
+            if line.startswith("path,"):
+                continue
+            cell = line.split(",")
+            index, kind = int(cell[0]), cell[1]
+            if index not in groups:
+                groups[index] = (kind, [])
+            groups[index][1].append([float(cell[3]), float(cell[4])])
+
+    if scale is None:
+        warnings.warn(
+            f"{filename} has no `scale` header, so its coordinates are taken as "
+            "they are; if it is in millimetres the paths will come back a "
+            "thousand times too large", stacklevel=2)
+        scale = 1.0
+
+    out = []
+    for index in sorted(groups):
+        kind, rows = groups[index]
+        nodes = onp.asarray(rows, dtype=float) / scale
+        if len(nodes) >= 2:
+            out.append(Path(nodes, kind, index))
+    return out
+
 
 
 #: AutoCAD colour indices standing in for :data:`KIND_COLOURS`, in the same

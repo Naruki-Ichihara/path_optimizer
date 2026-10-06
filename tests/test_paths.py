@@ -648,6 +648,71 @@ def test_read_svg_warns_about_what_it_skipped(tmp_path):
     assert len(got) == 1                             # the curve is not a toolpath
 
 
+# ── CSV ──────────────────────────────────────────────────────────────────────
+
+def test_csv_round_trips_geometry_kind_and_order(tmp_path):
+    src = P.tag([line(0.001 * k) for k in range(3)], "fibre") + P.tag([loop()], "outline")
+    f = tmp_path / "p.csv"
+    P.write_csv(src, f)
+
+    back = P.read_csv(f)
+    assert [p.kind for p in back] == ["fibre"] * 3 + ["outline"]
+    for got, want in zip(back, src, strict=True):
+        assert got.nodes == pytest.approx(want.nodes, rel=1e-9, abs=1e-11)
+    assert back[-1].is_closed
+
+
+def test_csv_needs_no_out_of_band_scale(tmp_path):
+    f = tmp_path / "p.csv"
+    P.write_csv([line(0.002)], f, scale=1.0, units="m")
+    assert P.read_csv(f)[0].nodes == pytest.approx(line(0.002), abs=1e-9)
+
+
+def test_csv_without_a_scale_header_warns(tmp_path):
+    f = tmp_path / "p.csv"
+    f.write_text("path,kind,seq,x,y\n0,fibre,0,0,0\n0,fibre,1,1,0\n")
+    with pytest.warns(UserWarning, match="no `scale` header"):
+        back = P.read_csv(f)
+    assert back[0].nodes == pytest.approx(onp.array([[0.0, 0.0], [1.0, 0.0]]))
+
+
+def test_csv_header_records_the_units(tmp_path):
+    f = tmp_path / "p.csv"
+    P.write_csv([line(0.0)], f)
+    head = f.read_text().splitlines()[:3]
+    assert head[1] == "# scale=1000.0  units=mm"
+    assert head[2] == "path,kind,seq,x,y"
+
+
+def test_csv_z_column_is_optional(tmp_path):
+    f = tmp_path / "p.csv"
+    P.write_csv([line(0.0)], f, z=0.2)
+    rows = f.read_text().splitlines()
+    assert rows[2] == "path,kind,seq,x,y,z"
+    assert rows[3].endswith(",0.2")
+    # The z column is a layer label, not geometry: reading gives plane curves.
+    assert P.read_csv(f)[0].nodes.shape[1] == 2
+
+
+def test_csv_keeps_the_row_order_it_was_given(tmp_path):
+    # `seq` is for a reader, not for the parser: sorting on it would quietly
+    # repair a shuffled file, and a shuffled toolpath is not a toolpath.
+    f = tmp_path / "p.csv"
+    f.write_text("# scale=1\npath,kind,seq,x,y\n"
+                 "0,a,5,2,0\n0,a,1,0,0\n")
+    assert P.read_csv(f)[0].nodes == pytest.approx(onp.array([[2.0, 0.0], [0.0, 0.0]]))
+
+
+def test_csv_rejects_a_kind_with_a_comma(tmp_path):
+    with pytest.raises(ValueError, match="cannot go in a CSV column"):
+        P.write_csv([P.Path(line(0.0), "a,b")], tmp_path / "p.csv")
+
+
+def test_csv_warns_on_an_empty_drawing(tmp_path):
+    with pytest.warns(UserWarning, match="no paths"):
+        P.write_csv([], tmp_path / "p.csv")
+
+
 # ── DXF export ───────────────────────────────────────────────────────────────
 
 def dxf_pairs(text):
