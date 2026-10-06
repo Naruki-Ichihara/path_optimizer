@@ -82,6 +82,7 @@ __all__ = [
     "simplify",
     "trim_hairpins",
     "spread_ends",
+    "clear_ends",
     "turn_radius",
     "order_paths",
     "travel_distance",
@@ -1480,6 +1481,135 @@ def smooth(paths, *, iterations: int = 10, lam: float = 0.5,
                 q = _laplacian_step(q, closed, lam)
                 q = _laplacian_step(q, closed, mu)
         out.append(Path(q, path.kind, path.path_id))
+    return out
+
+
+def _retreat_end(nodes, arc, start, step, other_a, other_b, tree, reach,
+                 clearance, max_retreat):
+    """Index the end should move to so its bead clears everything around it.
+
+    ``start`` is the end being walked, ``step`` which way to walk (+1 from the
+    first vertex, -1 from the last).  Distance is measured to segments, not to
+    vertices: the thing a bead cap runs into is usually the middle of a long
+    one.
+    """
+    here = start
+    while True:
+        point = nodes[here]
+        near = tree.query_ball_point(point, reach)
+        clear = True
+        for j in near:
+            a, b = other_a[j], other_b[j]
+            ab = b - a
+            t = onp.clip(((point - a) @ ab) / max(float(ab @ ab), 1e-30), 0.0, 1.0)
+            if float(onp.linalg.norm(point - (a + t * ab))) < clearance:
+                clear = False
+                break
+        if clear:
+            return here
+        nxt = here + step
+        if not 0 <= nxt < len(nodes) or abs(arc[nxt] - arc[start]) > max_retreat:
+            return here
+        here = nxt
+
+
+def clear_ends(paths, *, clearance: float, max_retreat: float | None = None,
+               min_length: float | None = None, skip: float | None = None):
+    """Walk every free end back until its bead touches nothing.
+
+    :func:`trim_hairpins` opens a gap between the two ends it cuts, and nothing
+    else: the cut lands where those two stand far enough apart, which says
+    nothing about the stripe running alongside.  A bead's end is a half disc of
+    the full width, and on a real part two of those came to rest against a
+    neighbouring pass -- 9 mm^3 of overlap that CAD found and the pair-wise
+    clearance could not.
+
+    This measures each free end against **everything else in the run** and
+    drops vertices until it is ``clearance`` clear of all of it.  Segments, not
+    vertices: after :func:`simplify` the thing an end runs into is usually the
+    middle of a long one, which a vertex-to-vertex test walks straight past.
+
+    Nothing moves -- only vertices at the ends go -- so every point that
+    survives is still where the optimiser put it.
+
+    Parameters
+    ----------
+    clearance : float
+        How far an end must stand from any other material, centre line to
+        centre line, in the mesh's units.  One bead width makes two beads meet
+        without overlapping.
+    max_retreat : float, optional
+        Give up after this much arc length and leave the end where it got to.
+        Defaults to ``5 * clearance``.  It bounds the damage where an end
+        cannot get clear at all, which is a path that was going to print badly
+        whatever is done to it.
+    min_length : float, optional
+        Drop what is left of a path shorter than this.  Defaults to
+        ``clearance``.
+    skip : float, optional
+        Ignore the end's **own** path within this arc length of it; otherwise
+        an end is always "too close" to the path it is the end of.  Defaults to
+        ``3 * clearance``.
+
+    Returns
+    -------
+    list of :class:`Path`
+        Same order, same kinds, minus any path that was consumed.  Closed paths
+        pass through untouched -- they have no free end.
+
+    See Also
+    --------
+    trim_hairpins : opens the gap this then widens against the neighbours.
+    spread_ends : moves an end instead of shortening to it.
+    """
+    if clearance <= 0:
+        raise ValueError(f"clearance must be positive, got {clearance}")
+    max_retreat = 5.0 * clearance if max_retreat is None else max_retreat
+    min_length = clearance if min_length is None else min_length
+    skip = 3.0 * clearance if skip is None else skip
+
+    from scipy.spatial import cKDTree
+
+    items = _as_paths(paths)
+    if not items:
+        return []
+    nodes = [onp.asarray(p.nodes, dtype=float) for p in items]
+    arcs = [onp.concatenate([[0.0], onp.cumsum(
+        onp.linalg.norm(onp.diff(q, axis=0), axis=1))]) for q in nodes]
+
+    # Every segment of the run, with the path and arc span it belongs to.
+    seg_a = onp.vstack([q[:-1] for q in nodes])
+    seg_b = onp.vstack([q[1:] for q in nodes])
+    seg_owner = onp.concatenate([onp.full(len(q) - 1, i) for i, q in enumerate(nodes)])
+    seg_s = onp.concatenate([0.5 * (a[:-1] + a[1:]) for a in arcs])
+    mid = 0.5 * (seg_a + seg_b)
+    reach = clearance + float(onp.linalg.norm(seg_b - seg_a, axis=1).max())
+
+    out: list[Path] = []
+    for i, path in enumerate(items):
+        q, arc = nodes[i], arcs[i]
+        if path.is_closed or len(q) < 3:
+            out.append(path)
+            continue
+        # Both ends are measured against the original path, then it is cut
+        # once.  Walking one end and re-slicing before the other turns every
+        # index into a different index, which is a bug waiting to be written.
+        bounds = []
+        for end, step in ((0, 1), (len(q) - 1, -1)):
+            keep = ~((seg_owner == i) & (onp.abs(seg_s - arc[end]) < skip))
+            idx = onp.flatnonzero(keep)
+            if not len(idx):
+                bounds.append(end)
+                continue
+            bounds.append(_retreat_end(q, arc, end, step, seg_a[idx], seg_b[idx],
+                                       cKDTree(mid[idx]), reach, clearance,
+                                       max_retreat))
+        lo, hi = bounds
+        if hi - lo + 1 < 2:
+            continue
+        candidate = Path(q[lo:hi + 1].copy(), path.kind, path.path_id)
+        if candidate.length >= min_length:
+            out.append(candidate)
     return out
 
 

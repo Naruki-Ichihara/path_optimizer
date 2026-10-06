@@ -644,6 +644,13 @@ def main():
     # awkward joins to sequence.
     trimmed = paths.order_paths(paths.connect(
         trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True)) + rim
+    # `trim_hairpins` opens a gap between the two ends it cuts and nothing
+    # else, which says nothing about the stripe running alongside.  A bead's
+    # end is a half disc of the full width, and CAD found two of them resting
+    # against a neighbouring pass.  This walks each free end back until it is a
+    # bead clear of everything -- the perimeter included, which is why it is
+    # given the whole run and not just the fill.
+    trimmed = paths.order_paths(paths.clear_ends(trimmed, clearance=bead))
     print(f"hairpins: {len(fibre)} -> {len(trimmed) - len(rim)} fill paths"
           + (f" + {len(rim)} outline" if rim else ""))
 

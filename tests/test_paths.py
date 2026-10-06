@@ -312,6 +312,54 @@ def test_connect_keeps_the_first_piece_identity():
     assert joined[0].path_id is not None
 
 
+# ── Clearing the ends ────────────────────────────────────────────────────────
+
+def test_clear_ends_retreats_until_the_end_is_clear():
+    wall = onp.stack([onp.linspace(-0.02, 0.02, 3), onp.zeros(3)], axis=1)
+    stub = onp.stack([onp.zeros(40), onp.linspace(0.02, 0.0, 40)], axis=1)
+    out = P.clear_ends([wall, stub], clearance=0.002)
+
+    assert out[0].nodes == pytest.approx(wall)          # the wall is untouched
+    assert abs(out[1].end[1]) >= 0.002
+    assert len(out[1].nodes) < len(stub)
+    # Nothing moved: what is left is a slice of what went in.
+    src = {tuple(q) for q in stub}
+    assert all(tuple(q) in src for q in out[1].nodes)
+
+
+def test_clear_ends_measures_segments_not_vertices():
+    # The wall's vertices are 40 mm apart, so a vertex-to-vertex test finds
+    # nothing near the stub at all -- which is how two overlaps got shipped.
+    wall = onp.array([[-0.02, 0.0], [0.02, 0.0]])
+    stub = onp.stack([onp.zeros(40), onp.linspace(0.02, 0.0, 40)], axis=1)
+    assert onp.linalg.norm(wall - stub[-1], axis=1).min() > 0.019
+
+    out = P.clear_ends([wall, stub], clearance=0.002)
+    assert abs(out[1].end[1]) >= 0.002
+
+
+def test_clear_ends_leaves_a_lone_path_and_a_loop_alone():
+    stub = onp.stack([onp.linspace(0.0, 0.02, 20), onp.zeros(20)], axis=1)
+    assert P.clear_ends([stub], clearance=0.002)[0].nodes == pytest.approx(stub)
+    assert P.clear_ends([loop()], clearance=0.002)[0].nodes == pytest.approx(loop())
+
+
+def test_clear_ends_gives_up_at_max_retreat():
+    # A stub that runs along the wall can never get clear; it must be bounded
+    # rather than consumed.
+    wall = onp.stack([onp.linspace(-0.02, 0.02, 3), onp.zeros(3)], axis=1)
+    stub = onp.stack([onp.linspace(-0.015, 0.015, 40), onp.full(40, 0.0005)], axis=1)
+    out = P.clear_ends([wall, stub], clearance=0.002, max_retreat=0.002,
+                       min_length=0.0)
+    assert len(out) == 2
+    assert out[1].length > 0.02
+
+
+def test_clear_ends_rejects_a_non_positive_clearance():
+    with pytest.raises(ValueError, match="clearance must be positive"):
+        P.clear_ends([line(0.0)], clearance=0.0)
+
+
 # ── Simplifying ──────────────────────────────────────────────────────────────
 
 def test_simplify_collapses_a_straight_run_to_its_ends():
