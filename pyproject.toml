@@ -46,8 +46,14 @@ dependencies = [
     # install path_optimizer` without a build step, and neither touches JAX.
     # `pyvista[jupyter]` rather than bare pyvista: the extra is trame, which is
     # what makes the viewer interactive in a notebook instead of a static PNG.
+    #
+    # Capped below 0.49: its _allow_ipython_completion() guards on `'IPython' in
+    # sys.modules` and then imports IPython.core.guarded_eval, which only exists
+    # from IPython 8.11. In a notebook IPython is always loaded, so on Colab --
+    # pinned to IPython 7.x -- importing pyvista at all raises ModuleNotFoundError.
+    # Lift the cap once upstream checks the version it is importing from.
     "cadquery-ocp",
-    "pyvista[jupyter]",
+    "pyvista[jupyter]<0.49",
 ]
 
 [project.optional-dependencies]

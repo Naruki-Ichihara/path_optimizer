@@ -467,7 +467,23 @@ def to_pyvista(shape, *, deflection: float = 0.05, angle: float = 0.5):
 
     ``shape`` may also be a path to a STEP file, which is read first.
     """
-    import pyvista as pv
+    try:
+        import pyvista as pv
+    except ModuleNotFoundError as exc:                # pragma: no cover
+        if "guarded_eval" not in str(exc):
+            raise
+        import IPython
+
+        raise ImportError(
+            f"pyvista cannot be imported under IPython {IPython.__version__}. "
+            "From 0.49 it checks that IPython is loaded and then imports "
+            "IPython.core.guarded_eval, which only exists from IPython 8.11, so "
+            "in a notebook on an older IPython -- Colab's, at the time of "
+            "writing -- importing it raises. path_optimizer asks for "
+            "pyvista<0.49 for that reason; this environment has a newer one.\n"
+            '    pip install -q "pyvista[jupyter]<0.49"\n'
+            "then restart the kernel."
+        ) from exc
 
     if isinstance(shape, (str, os.PathLike)):
         shape = read_step(shape)
