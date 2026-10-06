@@ -39,6 +39,15 @@ dependencies = [
     # (numpy / plotly / pydantic) are JAX-free, so it is safe to resolve normally
     # inside the container.
     "fullcontrol @ git+https://github.com/FullControlXYZ/fullcontrol",
+    # path_optimizer.solids: the bead solids and their STEP, and the viewer that
+    # shows them. A geometry kernel is a heavy thing to require -- the OCP wheel
+    # is 67 MB and VTK is larger -- but both resolve to manylinux wheels on the
+    # Pythons Colab runs (cp311-cp314), so a notebook gets them from `pip
+    # install path_optimizer` without a build step, and neither touches JAX.
+    # `pyvista[jupyter]` rather than bare pyvista: the extra is trame, which is
+    # what makes the viewer interactive in a notebook instead of a static PNG.
+    "cadquery-ocp",
+    "pyvista[jupyter]",
 ]
 
 [project.optional-dependencies]
@@ -111,6 +120,12 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+# Notebooks are read a cell at a time, so they are written tighter than library
+# code: `ax.set_title(...); ax.set_ylabel(...)` on one line, a lambda where a
+# def would cost three. Lint them for real errors, not for house style.
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E702", "E731", "B905"]
 
 [tool.mypy]
 python_version = "3.11"

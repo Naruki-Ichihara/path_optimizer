@@ -46,6 +46,10 @@ Writes into ``examples/output_mbb_fibre/``:
 * ``stripes.png``  — the relaxed stripe field
 * ``stripes.vtu``  — stripe field + director, for ParaView
 * ``paths.svg``    — the extracted fibre print paths
+* ``paths.dxf``    — the sequenced toolpath for CAD/CAM (DXF R12)
+* ``paths.step``   — the same as STEP AP214 wireframe curves
+* ``beads.step``   — the deposited material as B-rep solids (needs the
+  ``solids`` extra; skipped without it)
 * ``design.json``  — the connected, ordered toolpath as a FullControl design
 * ``paths.gcode``  — g-code for ``PRINTER``, via FullControl
 
@@ -75,18 +79,54 @@ from path_optimizer import objectives as obj
 
 # ── Geometry and material (SI units, so the stripe pitch is meaningful) ──────
 
-LX, LY = 0.200, 0.050        # full span : height (4:1)
-NX, NY = 200, 50             # optimisation elements (1 mm)
+LX, LY = 1, 0.40        # full span : height (4:1)
+NX, NY = 500, 200             # optimisation elements (1 mm)
 THICKNESS = 2.0e-3           # out-of-plane
 LOAD = 1.0e3                 # total downward force on the load patch [N]
 
-LAMINA = materials.Lamina()          # CFRP
-POLYMER = materials.Polymer()        # thermoplastic matrix
-SGN_BETA = 10.0                      # orientation-tensor sharpness
+# Materials.  Every constant is spelled out -- `materials` ships no defaults,
+# because a stiffness nobody chose decides the optimum in silence.
+LAMINA = materials.Lamina(
+    E1=6.16e6,      # along the fibre
+    E2=2.84e6,       # across it
+    G12=0.74e6,
+    nu12=0.22,
+)                    # G13/G23 unset: plane stress never reads them
 
-VOLUME_FRACTION = 0.4
+# What fills the low-density regions, and it changes what is being optimised.
+#
+#   None                        -> void.  The design says WHERE THE PART IS;
+#                                  rho = 0 carries no load.  Ordinary topology
+#                                  optimisation, and what this example does.
+#   materials.Polymer(E=.., nu=..) -> matrix.  The design says HOW MUCH FIBRE to
+#                                  add to a part that exists everywhere -- the
+#                                  printed-composite reading.  Note that a 2 GPa
+#                                  matrix against a 140 GPa fibre leaves the
+#                                  "void" at 1/59 of the solid stiffness, so the
+#                                  optimiser has far less reason to empty it.
+MATRIX = None
+E_MIN = 1e-9         # void stiffness floor, so the tangent stays invertible
+# Sharpness of the off-diagonal projection.  2.0, not feax's own 10.0 --
+# see materials.DEFAULT_SGN_BETA for the measurements.  At 10 the projection is
+# already saturated at the start, each node commits to a direction branch before
+# there is any orientation signal, and the result came out 2.1x worse than
+# simply laying every fibre in one direction.
+SGN_BETA = materials.DEFAULT_SGN_BETA
+
+# Transverse knock-down, continued back to 1.  Only the contrast between E1 and
+# E2 makes one fibre direction better than another, and at E1/E2 = 2.17 that
+# contrast is too weak for the direction to be chosen: the optimiser ends up
+# with an orientation field worse than laying every fibre the same way.  Scaling
+# E2 down exaggerates the contrast while the direction is being decided, and the
+# continuation brings it back so the last iterations are the real material.
+# Measured here: 1.585e+03 J without it (losing to a uniform direction by 1.12x)
+# against 1.019e+03 J with it (beating one by 1.43x).  See
+# materials.KNOCKDOWN_NOTE.  Set to 1.0 to switch it off.
+KNOCKDOWN_MIN = 0.02
+
+VOLUME_FRACTION = 0.5
 FILTER_RADIUS = 3.0 * (LX / NX)      # ~3 elements
-MAX_ITER = 150
+MAX_ITER = 200
 
 # Regulariser weights.  The compliance is normalised by its initial value, so
 # these are directly comparable to it: at 0.5 a fully isotropic orientation
@@ -97,18 +137,18 @@ W_MAG = 0.5
 # collide there whatever the stripe stage does -- the geometry demands it.
 # Penalising the turn inside the objective, rather than smoothing the finished
 # design, lets the optimiser buy the smoothness back by moving material.
-W_SMOOTH = 0
+W_SMOOTH = 0.
 
 # ── Stripe stage ────────────────────────────────────────────────────────────
 
-PATH_PITCH = 1.0e-3          # centre-to-centre spacing of the printed paths
+PATH_PITCH = 3.0e-3          # centre-to-centre spacing of the printed paths
 # The paths are the ZERO CONTOURS of the stripe field, and cos(phi) crosses zero
 # twice per period -- so the stripe period is twice the pitch we want.  That is
 # also the cheap direction: the field needs ~6 elements per STRIPE period, which
 # is 3 per path spacing, a quarter of the nodes that generating at the pitch
 # itself and throwing away every other contour would cost.
 STRIPE_PERIOD = 2.0 * PATH_PITCH
-SH_NX, SH_NY = 600, 150      # 0.333 mm -> 6 elements per stripe period
+SH_NX, SH_NY = 1000, 400      
 # Start from an integrated phase field, not noise, and run only long enough to
 # saturate the amplitude.  Measured on this part: noise gives 33 defects and a
 # +4.4% pitch after ~105 steps; the phase seed gives 4 defects and +0.9% after
@@ -134,8 +174,30 @@ RHO_CUTOFF = 0.5             # density above which a node counts as fibre
 # lies over material, so past a few path pitches they start crossing voids.
 CONNECT_TOLERANCE = 5.0e-3   # m
 
+# Weld tolerance for the second pass, after the hairpins have been trimmed
+# out (`paths.trim_hairpins`).  Looser than the first: trimming leaves ends
+# that the original pass had already welded past, so a 5 mm reach rejoins
+# fewer of them.  Measured here: 5 mm leaves 148 paths, 10 mm leaves 101
+# for the same bridge quality, and 15 mm starts welding across the voids.
+REJOIN_TOLERANCE = 10.0e-3   # m
+
+# Height of the extruded bead in the CAD solid (`beads.step`) only -- the
+# g-code still uses LAYER_HEIGHT.  A single 0.2 mm layer is invisible beside
+# a 1 m beam, so the solid is written at the thickness the part is meant to
+# be, as if the layers were already stacked.
+SOLID_HEIGHT = 20.0          # mm
+
+# Vertex thinning before the CAD files are written (`paths.simplify`).  The
+# contours arrive at roughly one vertex per stripe-mesh element, which is far
+# more than the geometry needs.  Measured on this part at 2000x800: 0.05 mm of
+# tolerance keeps 5.5% of 161052 vertices and leaves the path-spacing
+# distribution unchanged to 0.2 percentage points, while 0.2 mm starts to
+# flatten the tight turns (|deviation| > 10% rises from 17.9% to 19.7%).
+# An eighth of the extrusion width is a good default.  Set to 0 to disable.
+CAD_TOLERANCE = 0.05e-3      # m
+
 LAYER_HEIGHT = 0.2           # mm
-EXTRUSION_WIDTH = 0.4        # mm
+EXTRUSION_WIDTH = 2.0        # mm
 PRINT_SPEED = 1000           # mm/min
 
 # FullControl's own profiles -- see paths.printers().  Nothing about the machine
@@ -188,7 +250,9 @@ class MBBFibre(po.Pipeline):
         # emits exactly that order.
         self.problem = plane.make_plane_stress(
             mesh,
-            materials.orientation_blend(LAMINA, POLYMER, sgn_beta=SGN_BETA),
+            materials.orientation_blend(LAMINA, MATRIX, sgn_beta=SGN_BETA,
+                                        e_min=E_MIN,
+                                        transverse_knockdown=True),
             thickness=THICKNESS,
             location_fns=(load_patch,),
             # Residual-side traction: positive ty pulls DOWN.
@@ -200,9 +264,11 @@ class MBBFibre(po.Pipeline):
             fe.DirichletBCSpec(location=roller, component=1, value=0.0),
         ]).create_bc(self.problem)
 
+        # Five volume vars now: the four design fields plus the knock-down,
+        # which is not a design variable -- it is uniform and scheduled.
         nv = fe.TracedParams.create_node_var
         sample = fe.TracedParams(volume_vars=tuple(
-            nv(self.problem, v) for v in (0.5, 0.0, 0.0, 0.0)))
+            nv(self.problem, v) for v in (0.5, 0.0, 0.0, 0.0, 1.0)))
         self.solver = po.make_linear_solver(self.problem, self.bc, sample)
         self.compliance = obj.create_compliance_fn(self.problem)
         self.volume = obj.create_volume_fn(self.problem)
@@ -213,16 +279,52 @@ class MBBFibre(po.Pipeline):
 
         # Normalise on the starting design so the regulariser weights above mean
         # the same thing whatever the load and material scale are.
-        n = mesh.points.shape[0]
+        self.n = mesh.points.shape[0]
+        # One normaliser per knock-down level, not one for the whole run.
+        # Normalising everything on the real material looks tidier but wrecks
+        # the objective: at k = 0.02 the structure is ~35x softer, so c arrives
+        # around 36 while ud and mag are still order 1 -- the regularisers stop
+        # mattering, and the scale of the objective jumps at every stage, which
+        # MMA's approximation and the x-tolerance both read as the design having
+        # settled.  Normalising at the current k keeps c ~ 1 throughout, so the
+        # weights above mean the same thing at every stage.
+        #
+        # k arrives traced (it is a continuation parameter inside the jitted
+        # objective), so it cannot key a Python cache.  c0(k) is smooth and
+        # monotone, so tabulate it once on a log grid and interpolate.
+        self._kd_grid = onp.geomspace(min(KNOCKDOWN_MIN, 1.0), 1.0, 9)
+        self._c0_grid = jnp.asarray([self._c0_solve(k) for k in self._kd_grid])
+        self._log_kd_grid = jnp.log(jnp.asarray(self._kd_grid))
+        self.c0 = float(self._c0_grid[-1])
+        print(f"Initial compliance (normaliser, real material): {self.c0:.6e} J")
+
+    def _c0_solve(self, knockdown):
+        """Compliance of the uniform starting design at this knock-down."""
+        n = self.n
         start = fe.TracedParams(volume_vars=(
             jnp.full(n, VOLUME_FRACTION), jnp.zeros(n), jnp.zeros(n),
-            jnp.zeros(n)))
-        self.c0 = float(self.compliance(self.solver(start)))
-        print(f"Initial compliance (normaliser): {self.c0:.6e} J")
+            jnp.zeros(n), jnp.full(n, float(knockdown))))
+        return float(self.compliance(self.solver(start)))
 
-    def _solve(self, design):
+    def _c0_at(self, knockdown):
+        """The tabulated normaliser, read at a traced knock-down."""
+        return jnp.interp(jnp.log(knockdown), self._log_kd_grid, self._c0_grid)
+
+    def _solve(self, design, knockdown):
         return self.solver(fe.TracedParams(volume_vars=(
-            design["simp"], design["x1"], design["x2"], design["x3"])))
+            design["simp"], design["x1"], design["x2"], design["x3"],
+            jnp.full(self.n, knockdown))))
+
+    @staticmethod
+    def knockdown(kd_ramp):
+        """Geometric ramp KNOCKDOWN_MIN -> 1 as ``kd_ramp`` goes 0 -> 1.
+
+        Continuation is additive, and a linear ramp on a stiffness ratio spends
+        almost all of its iterations near 1, which is the part that does not
+        need help.  Continuing the exponent instead keeps the early, strongly
+        anisotropic stages where the direction is actually decided.
+        """
+        return KNOCKDOWN_MIN ** (1.0 - kd_ramp)
 
     def transform(self, design, penalty=3.0, beta=1.0, **params):
         """SIMP + Heaviside on the density; the orientation passes through.
@@ -234,13 +336,15 @@ class MBBFibre(po.Pipeline):
         rho_phys = gene.heaviside_projection(design["rho"], beta=beta)
         return {**design, "rho_phys": rho_phys, "simp": rho_phys ** penalty}
 
-    def objective(self, design, **params):
-        c = self.compliance(self._solve(design)) / self.c0
+    def objective(self, design, kd_ramp=1.0, **params):
+        kd = self.knockdown(kd_ramp)
+        c = self.compliance(self._solve(design, kd)) / self._c0_at(kd)
         ud = obj.ud_penalty(design, LAYERS, sgn_beta=SGN_BETA)
         mag = obj.magnitude_consistency(design, LAYERS, sgn_beta=SGN_BETA)
         smooth = self.smoothness(design, LAYERS)
         loss = c + W_UD * ud + W_MAG * mag + W_SMOOTH * smooth
-        return loss, {"c": c, "ud": ud, "mag": mag, "smooth": smooth}
+        return loss, {"c": c, "ud": ud, "mag": mag, "smooth": smooth,
+                      "knockdown": kd}
 
     @po.constraint(target=VOLUME_FRACTION)
     def volfrac(self, design, **params):
@@ -353,7 +457,18 @@ def main():
         continuations={
             "penalty": po.Continuation(1.0, 3.0, update_every=40, step=0.5),
             "beta": po.Continuation(1.0, 8.0, update_every=40, step=2.0),
+            # 0 -> 1 drives the knock-down KNOCKDOWN_MIN -> 1 geometrically.
+            # It finishes well before the run ends, so the last third of the
+            # iterations are spent on the real material.
+            "kd_ramp": po.Continuation(0.0, 1.0, update_every=25, step=0.25),
         },
+        # Tighter than the defaults (1e-5).  With a continuation this strict a
+        # stop is not "converged" but "this level is done, move on", and 1e-5
+        # declared that after 4 iterations here -- the design had not started
+        # moving, it had only been inched.  These let each level actually run.
+        ftol_rel=1e-7,
+        xtol_rel=1e-7,
+        xtol_abs=1e-8,
         output_dir=OUT,
         snapshot_every=5,
     )
@@ -436,6 +551,55 @@ def main():
     print(f"travel: {paths.travel_distance(ordered) * 1e3:.0f} mm -> "
           f"{paths.travel_distance(final) * 1e3:.0f} mm")
     ordered = final
+
+    # ── CAD handoff ──
+    # The same sequenced toolpath in the two formats CAD and CAM read, so it can
+    # be laid over the part model, measured, or drawn.  `connect` has already
+    # welded the bridges into the polylines, so what goes out is what gets
+    # deposited -- travel moves are not geometry and are not written.
+    thin = paths.simplify(ordered, tolerance=CAD_TOLERANCE)
+    for ext, write in (("dxf", paths.write_dxf), ("step", paths.write_step)):
+        f = OUT / f"paths.{ext}"
+        write(thin, f)
+        print(f"Wrote {f} ({sum(len(p.nodes) for p in thin)} of "
+              f"{sum(len(p.nodes) for p in ordered)} vertices, "
+              f"{f.stat().st_size / 1024:.0f} kB)")
+
+    # ── Solids ──
+    # The same toolpath as the material it deposits, in B-rep.
+    #
+    # Hairpins are trimmed first.  A turn tighter than the bead's half-width is
+    # not a turn the printer can make -- it lays material over material -- and
+    # it is also what makes the solid self-intersect.  On this part it was 78
+    # of 106 paths.  After `connect`, never before: the gap trimming opens is
+    # one bead wide and CONNECT_TOLERANCE would weld it shut again.
+    from path_optimizer import solids
+
+    bead = EXTRUSION_WIDTH * 1e-3
+    # `extra` drops three more vertices each side once the clearance is met:
+    # the test is satisfied just past the apex, where the two beads still run
+    # alongside each other.  It took the beads OCC could not build from 5 to 1,
+    # at the same travel.
+    trimmed = paths.order_paths(
+        paths.trim_hairpins(thin, radius=0.5 * bead, extra=3))
+    # The cut lands on whatever vertex was there; this places it in the
+    # clearest space within a tenth of a bead width.
+    trimmed = paths.spread_ends(trimmed, move=0.1 * bead)
+    # Then weld what the trimming broke apart, to win the travel back.
+    # `no_cross` because a bridge is a straight line through whatever lies
+    # between the two ends: at 10 mm, three of them cut across other paths.
+    # Refusing those also shortened the travel, 3584 mm to 3137 mm -- they were
+    # awkward joins to sequence.
+    trimmed = paths.order_paths(paths.connect(
+        trimmed, tolerance=REJOIN_TOLERANCE, no_cross=True))
+    print(f"hairpins: {len(thin)} -> {len(trimmed)} paths, "
+          f"travel {paths.travel_distance(thin) * 1e3:.0f} -> "
+          f"{paths.travel_distance(trimmed) * 1e3:.0f} mm")
+
+    f = OUT / "beads.step"
+    report = solids.write_step_solid(
+        trimmed, f, width=EXTRUSION_WIDTH, height=SOLID_HEIGHT)
+    print(f"Wrote {f} ({report}, {f.stat().st_size / 1e6:.0f} MB)")
 
     # ── FullControl design ──
     # A design is a plain list of FullControl step objects, not a file format:
